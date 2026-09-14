@@ -1,0 +1,146 @@
+local BD = require("ui/bidi")
+local ConfirmBox = require("ui/widget/confirmbox")
+local DataStorage = require("datastorage")
+local Dispatcher = require("dispatcher")
+local LuaSettings = require("luasettings")
+local OPDSBrowser = require("opdsforcomic_browser")
+local UIManager = require("ui/uimanager")
+local WidgetContainer = require("ui/widget/container/widgetcontainer")
+local util = require("util")
+local _ = require("gettext")
+local T = require("ffi/util").template
+
+local OPDS = WidgetContainer:extend{
+    name = "opdsforcomic",
+    settings_file = DataStorage:getSettingsDir() .. "/opdsforcomic.lua",
+    settings = nil,
+    opds_settings = nil,
+    servers = nil,
+    downloads = nil,
+    pending_syncs = nil,
+    updated = nil,
+    default_servers = {
+        {
+            title = "Project Gutenberg",
+            url = "https://m.gutenberg.org/ebooks.opds/?format=opds",
+        },
+        {
+            title = "Standard Ebooks",
+            url = "https://standardebooks.org/feeds/opds",
+        },
+        {
+            title = "ManyBooks",
+            url = "http://manybooks.net/opds/index.php",
+        },
+        {
+            title = "Internet Archive",
+            url = "https://bookserver.archive.org/",
+        },
+        {
+            title = "textos.info (Spanish)",
+            url = "https://www.textos.info/catalogo.atom",
+        },
+        {
+            title = "Gallica (French)",
+            url = "https://gallica.bnf.fr/opds",
+        },
+    },
+}
+
+function OPDS:init()
+    self:onDispatcherRegisterActions()
+    self.ui.menu:registerToMainMenu(self)
+end
+
+function OPDS:loadSettings()
+    if self.settings then return end
+    self.settings = LuaSettings:open(self.settings_file)
+    if next(self.settings.data) == nil then
+        self.updated = true -- first run, force flush
+    end
+    self.opds_settings = self.settings:readSetting("settings", {})
+    self.servers = self.settings:readSetting("servers", self.default_servers)
+    self.downloads = self.settings:readSetting("downloads", {})
+    self.pending_syncs = self.settings:readSetting("pending_syncs", {})
+end
+
+function OPDS:onDispatcherRegisterActions()
+    Dispatcher:registerAction("opdsforcomic_show_catalog",
+        {category="none", event="ShowOPDSForComicCatalog", title=_("OPDS Catalog (Comic)"), filemanager=true,}
+    )
+end
+
+function OPDS:addToMainMenu(menu_items)
+    if not self.ui.document then -- FileManager menu only
+        menu_items.opdsforcomic = {
+            text = _("OPDS catalog (Comic)"),
+            sorting_hint = "search",
+            callback = function()
+                self:onShowOPDSForComicCatalog()
+            end,
+        }
+    end
+end
+
+function OPDS:onShowOPDSForComicCatalog()
+    self:loadSettings()
+    self.opds_browser = OPDSBrowser:new{
+        settings = self.opds_settings,
+        servers = self.servers,
+        downloads = self.downloads,
+        pending_syncs = self.pending_syncs,
+        title = _("OPDS catalog (Comic)"),
+        is_popout = false,
+        is_borderless = true,
+        title_bar_fm_style = true,
+        _manager = self,
+        file_downloaded_callback = function(file)
+            self:showFileDownloadedDialog(file)
+        end,
+        close_callback = function()
+            if self.opds_browser.download_list then
+                self.opds_browser.download_list.close_callback()
+            end
+            UIManager:close(self.opds_browser)
+            self.opds_browser = nil
+            if self.last_downloaded_file then
+                if self.ui.file_chooser then
+                    local pathname = util.splitFilePathName(self.last_downloaded_file)
+                    self.ui.file_chooser:changeToPath(pathname, self.last_downloaded_file)
+                end
+                self.last_downloaded_file = nil
+            end
+        end,
+    }
+    UIManager:show(self.opds_browser)
+end
+
+function OPDS:showFileDownloadedDialog(file)
+    self.last_downloaded_file = file
+    local confirm_box = ConfirmBox:new{
+        text = T(_("File saved to:\n%1\nWould you like to read the downloaded book now?"), BD.filepath(file)),
+        ok_text = _("Read now"),
+        ok_callback = function()
+            self.last_downloaded_file = nil
+            self.opds_browser.close_callback()
+            if self.ui.document then
+                self.ui:switchDocument(file)
+            else
+                self.ui:openFile(file)
+            end
+        end,
+    }
+    -- As the InfoMessage "Downloading" is getting closed, show this ConfirmBox on the next UI tick to avoid e-Ink rendering congestion
+    UIManager:nextTick(function()
+        UIManager:show(confirm_box)
+    end)
+end
+
+function OPDS:onFlushSettings()
+    if self.updated then
+        self.settings:flush()
+        self.updated = nil
+    end
+end
+
+return OPDS
