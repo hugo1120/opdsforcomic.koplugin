@@ -84,8 +84,15 @@ local function log(fmt, ...)
     end
 end
 
-local function nowMs()
+-- NOTE: ffi/util's getTimestamp() returns *seconds* (secs + usecs/1e6), not
+-- milliseconds. Keep the timestamps in that unit and convert only the delta,
+-- so the arithmetic stays in double precision.
+local function now()
     return ffiUtil.getTimestamp()
+end
+
+local function elapsedMs(started)
+    return math.floor((ffiUtil.getTimestamp() - started) * 1000)
 end
 
 --- djb2, kept in double range so it stays exact. Filenames only need to be
@@ -365,7 +372,7 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
             return nil, "invalid protocol"
         end
 
-        local started = nowMs()
+        local started = now()
         local page_data = {}
         if is_prefetch then
             socketutil:set_timeout(PREFETCH_BLOCK_TIMEOUT, PREFETCH_TOTAL_TIMEOUT)
@@ -382,7 +389,7 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
             password    = password,
         })
         socketutil:reset_timeout()
-        local elapsed = nowMs() - started
+        local elapsed = elapsedMs(started)
 
         if code == 200 then
             local data = table.concat(page_data)
@@ -425,7 +432,7 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
             return RenderImage:renderImageFile("resources/koreader.png", false)
         end
         local index = key - 1
-        local started = nowMs()
+        local started = now()
         local data, source = loadPage(index, false)
         if not data then
             log("page %d: no data, showing placeholder", index)
@@ -446,7 +453,7 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
             cacheDrop(index)
             return RenderImage:renderImageFile("resources/koreader.png", false)
         end
-        log("page %d: ready in %d ms via %s", index, nowMs() - started, source)
+        log("page %d: ready in %d ms via %s", index, elapsedMs(started), source)
         return bb
     end})
 
