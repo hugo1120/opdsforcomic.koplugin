@@ -53,11 +53,20 @@ local PREFETCH_BEHIND = 2
 --- How long to wait after a page turn before fetching, in seconds. Lets the
 --- e-ink refresh settle before the UI thread blocks on a fetch.
 local PREFETCH_DELAY = 0.35
---- Delay between successive fetches while filling the window. Much shorter
---- than PREFETCH_DELAY: that delay exists to let a page turn settle, and
---- paying it again between chain steps just means the window fills slower
---- than the link allows, so the reader outruns it.
-local PREFETCH_CHAIN_DELAY = 0.05
+--- Delay between successive fetches while filling the window. Shorter than
+--- PREFETCH_DELAY, which exists to let a page turn settle, but no longer
+--- near-zero: each step is a *synchronous* fetch that owns the UI thread, so
+--- back-to-back steps meant several hundred milliseconds of dead input right
+--- after every page turn — the moment the reader is most likely to tap
+--- something. The window fills at the speed of the link, not of the timer, so
+--- a quarter second between steps costs almost nothing and leaves room for a
+--- tap to be served in between.
+local PREFETCH_CHAIN_DELAY = 0.25
+--- When a dialog is on top of the viewer, a prefetch is postponed by this
+--- much and retried, up to PREFETCH_DEFER_MAX times, instead of blocking the
+--- UI thread behind an open dialog. Roughly ten seconds of patience in total.
+local PREFETCH_DEFER_DELAY = 0.5
+local PREFETCH_DEFER_MAX = 20
 --- Memory cache bound, in bytes rather than pages, so a server with large
 --- pages keeps fewer of them instead of quietly eating memory. MIN_PAGES is
 --- the floor that keeps it usable even when a single page is huge.
@@ -126,6 +135,79 @@ local function L(en, zh)
     local lang = _.current_lang
     if lang and lang:sub(1, 2) == "zh" then return zh end
     return en
+end
+
+--- Showing two pages at once, laid out the way the KOReader comic plugin
+--- (comicreader.koplugin) does it, which is also where the pairing rules and
+--- the "first page is cover" idea come from.
+---
+--- Here it is a display-time composite rather than a reader-level one: the
+--- page-stream path hands ImageViewer a single buffer, so two pages are
+--- decoded and stitched into one wide image before display. Prefetching is
+--- untouched by any of this, because it caches raw bytes per source page
+--- regardless of how many of them end up side by side.
+local DUAL_KEY = "opdsforcomic_dual_page"
+local DUAL_RTL_KEY = "opdsforcomic_dual_rtl"
+local DUAL_COVER_KEY = "opdsforcomic_dual_cover"
+--- Remembers whether the current DUAL_KEY value came from the rotation or from
+--- a by-hand toggle. Rotation and dual-page are tied together, but only
+--- dual-page is persisted: without this flag a chapter opened right after a
+--- rotated one would come up two-page while upright. Tracking the origin lets
+--- an automatic value be dropped on entry while a by-hand choice carries over.
+local DUAL_AUTO_KEY = "opdsforcomic_dual_auto"
+
+local function dualPageOn()
+    return G_reader_settings:isTrue(DUAL_KEY)
+end
+
+--- Right to left unless the reader says otherwise: this is a manga plugin.
+local function dualRtl()
+    local v = G_reader_settings:readSetting(DUAL_RTL_KEY)
+    return v == nil or v == true
+end
+
+local function dualCoverFirst()
+    return G_reader_settings:isTrue(DUAL_COVER_KEY)
+end
+
+--- Source pages (1-based) making up a 1-based spread.
+---
+--- Without a cover the spreads are (1,2) (3,4) (5,6)…; with one, page 1
+--- stands alone and the spreads become (2,3) (4,5) (6,7)… — that shift is
+--- the whole point of the setting, since a scanned cover otherwise gets
+--- paired with the first story page and every later pair is out by one.
+local function spreadPages(spread, pages)
+    if not dualPageOn() then return { spread } end
+    local base
+    if dualCoverFirst() then
+        if spread <= 1 then return { 1 } end
+        base = 2 * (spread - 1)
+    else
+        base = 2 * spread - 1
+    end
+    if base > pages then return {} end
+    local out = { base }
+    if base + 1 <= pages then out[#out + 1] = base + 1 end
+    return out
+end
+
+local function spreadCountOf(pages)
+    if not dualPageOn() then return pages end
+    if pages < 1 then return 0 end
+    if dualCoverFirst() then
+        return 1 + math.floor((pages - 1) / 2)
+    end
+    return math.ceil(pages / 2)
+end
+
+--- Inverse of spreadPages: which spread holds a given 1-based source page.
+local function spreadOfPage(page)
+    if not dualPageOn() then return page end
+    if dualCoverFirst() then
+        if page <= 1 then return 1 end
+        return math.floor(page / 2) + 1
+    end
+    return math.ceil(page / 2)
 end
 
 local LOG_PREFIX = "opdsforcomic: "
@@ -402,14 +484,17 @@ local function cropTo(bb, box)
     return out
 end
 
-local function renderBounded(data, index, crop_cache)
+local function renderBounded(data, index, crop_cache, skip_crop)
     local bb = RenderImage:renderImageData(data, #data, false)
     if not bb then
         log("page %d: decode failed (%d bytes)", index, #data)
         return nil
     end
 
-    if G_reader_settings:isTrue(AUTOCROP_KEY) and crop_cache then
+    -- skip_crop is set while the view is rotated: turning the page sideways
+    -- is usually about seeing the whole spread, so trimming it there works
+    -- against the reader. The measured box stays cached either way.
+    if not skip_crop and G_reader_settings:isTrue(AUTOCROP_KEY) and crop_cache then
         -- Measured once per page and remembered; false means "measured, and
         -- there was nothing worth cutting".
         local box = crop_cache[index]
@@ -563,6 +648,10 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
     local crop_cache = {}
     local closed = false
     local retried = {}
+    -- How many times the prefetch chain has deferred because a dialog was on
+    -- top of the viewer. Bounded, so a widget that never goes away cannot park
+    -- the chain forever — the next page turn re-arms it anyway.
+    local prefetch_deferrals = 0
     local last_failure_notice = 0
 
     local function cacheCount()
@@ -579,9 +668,20 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
     --- MIN_PAGES keeps the cache usable even if one page exceeds the byte cap.
     local function cacheEvict()
         while cache_bytes > MEM_CACHE_MAX_BYTES and cacheCount() > MEM_CACHE_MIN_PAGES do
+            -- Distances are measured in 0-based source pages, because that is
+            -- what the keys are. The viewer, however, counts spreads once
+            -- dual-page is on, so its page number is only the source index in
+            -- single-page mode: in dual mode it is roughly half of it. Feeding
+            -- it straight in would measure every distance from a point behind
+            -- the reader and so evict exactly the pages ahead of them, which is
+            -- the opposite of the intent above.
+            --
             -- viewer is still nil while ImageViewer's constructor loads the
             -- very first page; treat that as being on page 0.
-            local current = (viewer and viewer._images_list_cur or 1) - 1
+            local current = 0
+            if viewer then
+                current = (spreadPages(viewer._images_list_cur or 1, count)[1] or 1) - 1
+            end
             local worst, worst_dist
             for index, data in pairs(cache) do
                 local dist = math.abs(index - current)
@@ -689,35 +789,99 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
     -- below would call a table instead of translating a string and crash
     -- KOReader. Upstream has the same trap at opdspse.lua:106; it is only
     -- reachable there on an invalid protocol, which is why it went unnoticed.
+    -- Renders one ImageViewer page. In dual-page mode that is a spread: both
+    -- source pages get decoded and stitched into a single wide buffer. The
+    -- caches and the prefetcher stay keyed by source page, so nothing about
+    -- them has to know how many pages are shown at once.
     setmetatable(page_table, {__index = function (_page_table, key)
         if type(key) ~= "number" then
             return RenderImage:renderImageFile("resources/koreader.png", false)
         end
-        local index = key - 1
         local started = now()
-        local data, source = loadPage(index, false)
-        if not data then
-            log("page %d: no data, showing placeholder", index)
+        -- viewer is still nil while ImageViewer's constructor loads page one.
+        local rotated = viewer and viewer.rotated
+        local wanted = spreadPages(key, count)
+
+        local function placeholder(label)
             -- Failures are deliberately not cached, so turning away and back
             -- retries instead of showing the placeholder forever. Tell the
             -- reader what happened, throttled so a run of failures is not a
             -- stream of popups.
+            log("%s: no data, showing placeholder", label)
             if os.time() - last_failure_notice > 20 then
                 last_failure_notice = os.time()
                 Notification:notify(
-                    T(_("Page %1 failed to load. Turn the page and back to retry."), index + 1),
+                    T(_("Page %1 failed to load. Turn the page and back to retry."), key),
                     Notification.SOURCE_ALWAYS_SHOW)
             end
             return RenderImage:renderImageFile("resources/koreader.png", false)
         end
-        local bb = renderBounded(data, index, crop_cache)
-        if not bb then
-            cacheDrop(index)
+
+        if #wanted == 0 then
             return RenderImage:renderImageFile("resources/koreader.png", false)
         end
-        log("page %d: ready in %d ms via %s", index, elapsedMs(started), source)
-        return bb
+
+        local bbs, source = {}, nil
+        for _, page in ipairs(wanted) do
+            local index = page - 1 -- caches are keyed by 0-based source page
+            local data, from = loadPage(index, false)
+            if not data then
+                for _, done in ipairs(bbs) do done:free() end
+                return placeholder("page " .. page)
+            end
+            source = source or from
+            local bb = renderBounded(data, index, crop_cache, rotated)
+            if not bb then
+                cacheDrop(index)
+                for _, done in ipairs(bbs) do done:free() end
+                return placeholder("page " .. page)
+            end
+            bbs[#bbs + 1] = bb
+        end
+
+        if #bbs == 1 then
+            log("page %d: ready in %d ms via %s", key, elapsedMs(started), source)
+            return bbs[1]
+        end
+
+        -- Stitch. Right to left puts the first page on the right, which is
+        -- the whole difference between the two reading directions.
+        local w1, h1 = bbs[1]:getWidth(), bbs[1]:getHeight()
+        local w2, h2 = bbs[2]:getWidth(), bbs[2]:getHeight()
+        local Blitbuffer = require("ffi/blitbuffer")
+        local composite = Blitbuffer.new(w1 + w2, math.max(h1, h2), bbs[1]:getType())
+        if composite then
+            if dualRtl() then
+                composite:blitFrom(bbs[2], 0, 0, 0, 0, w2, h2)
+                composite:blitFrom(bbs[1], w2, 0, 0, 0, w1, h1)
+            else
+                composite:blitFrom(bbs[1], 0, 0, 0, 0, w1, h1)
+                composite:blitFrom(bbs[2], w1, 0, 0, 0, w2, h2)
+            end
+        end
+        -- The source buffers are dead weight once stitched. Freeing them here
+        -- keeps the peak at three buffers instead of holding all of them.
+        for _, done in ipairs(bbs) do done:free() end
+        if not composite then
+            return placeholder("spread " .. key)
+        end
+
+        log("spread %d (%s): ready in %d ms via %s as %dx%d", key,
+            table.concat(wanted, ","), elapsedMs(started), source,
+            composite:getWidth(), composite:getHeight())
+        return composite
     end})
+
+    -- Rotation and dual-page travel together (see toggleRotation), but only one
+    -- of the two survives a chapter change: rotation is per-viewer state, so a
+    -- freshly opened chapter is always upright, while dual-page is persisted.
+    -- A chapter opened right after a rotated one would therefore come up
+    -- two-page with the view upright -- exactly the pairing the dual-page rule
+    -- exists to avoid. Drop the setting only when the rotation put it there;
+    -- a value the reader chose by hand is theirs to keep.
+    if dualPageOn() and G_reader_settings:isTrue(DUAL_AUTO_KEY) then
+        G_reader_settings:saveSetting(DUAL_KEY, false)
+    end
 
     local ImageViewer = require("ui/widget/imageviewer")
     viewer = ImageViewer:new{
@@ -725,8 +889,44 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
         fullscreen = true,
         with_title_bar = false,
         image_disposable = false, -- instead set page_table image_disposable to true
-        images_list_nb = count,
+        images_list_nb = spreadCountOf(count),
     }
+
+    -- Swipe-to-close is off: closing is the Close button's job.
+    --
+    -- A one-finger flick while the page is scaled to fit closes the whole
+    -- chapter and drops the reader back in the catalog (ImageViewer:onSwipe,
+    -- the "south" branch) — with no confirmation and nothing on screen to
+    -- explain it. On e-ink, where a tap that drifts a few millimetres is
+    -- indistinguishable from a short flick, that is a booby trap, and the
+    -- reader was not aiming at anything.
+    --
+    -- Note what is *not* done here: onSwipe itself is left alone, because
+    -- whether a given flick closes depends on the zoom level and on where the
+    -- finger started, and panning/zooming on the sides run through the same
+    -- handler. Re-deriving those conditions to carve out the one that closes
+    -- would mean duplicating frontend logic that can silently drift. Instead
+    -- the close is refused from the inside: anything reached *through* a swipe
+    -- cannot end the chapter, whatever the policy above it becomes.
+    --
+    -- Every other way out still works — the Close button, the Back key, a
+    -- multiswipe — so this cannot strand the reader.
+    local in_swipe = false
+    local orig_on_swipe = viewer.onSwipe
+    viewer.onSwipe = function(this, ...)
+        in_swipe = true
+        local handled = orig_on_swipe(this, ...)
+        in_swipe = false
+        return handled
+    end
+    local orig_on_close = viewer.onClose
+    viewer.onClose = function(this, ...)
+        if in_swipe then
+            log("swipe-to-close suppressed")
+            return true
+        end
+        return orig_on_close(this, ...)
+    end
 
     -- Re-render the current page from scratch. Used to recover from a failed
     -- load without making the reader navigate away and back by hand.
@@ -737,6 +937,133 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
         viewer:switchToImageNum(current)
     end
 
+    --- The source page the reader is looking at right now, under whatever
+    --- settings are in force at this moment. Call this *before* flipping a
+    --- setting that changes the pairing.
+    local function currentSourcePage()
+        local cur = viewer._images_list_cur or 1
+        return spreadPages(cur, count)[1] or 1
+    end
+
+    --- Applies a change that alters what a viewer page means. Dual-page and
+    --- the cover offset both re-pair the pages, so the position and the total
+    --- have to be remapped across the change; the source page under the
+    --- reader is the thing that stays fixed.
+    local function applyDisplayModeChange(source_page)
+        viewer._images_list_nb = spreadCountOf(count)
+        viewer._images_list_cur = spreadOfPage(source_page)
+        reloadCurrentPage()
+    end
+
+    --- Flips the rotation and puts the result on screen.
+    ---
+    --- Rotation carries dual-page with it, in both directions: a sideways view
+    --- is a two-page spread, which is the only reason to turn the page at all,
+    --- and an upright view is not. The two-page row in the display dialog still
+    --- works on its own -- turning it on by hand while upright is respected --
+    --- the next rotation change just re-syncs it.
+    ---
+    --- Defined after currentSourcePage/applyDisplayModeChange on purpose: a
+    --- local declared further down is not yet in scope here, and the calls
+    --- would quietly go to nil globals.
+    local function toggleRotation()
+        viewer.rotated = not viewer.rotated and true or false
+
+        local want_dual = viewer.rotated
+        local mode_changed = dualPageOn() ~= want_dual
+        log("rotate -> %s, dual-page -> %s%s", tostring(viewer.rotated),
+            tostring(want_dual), mode_changed and " (re-pairing)" or "")
+        if mode_changed then
+            -- Read the position *before* the flip: dual page renumbers every
+            -- viewer page, so the source page has to be carried across by hand
+            -- or the reader lands somewhere else entirely.
+            local src = currentSourcePage()
+            G_reader_settings:saveSetting(DUAL_KEY, want_dual)
+            G_reader_settings:saveSetting(DUAL_AUTO_KEY, true)
+            viewer._images_list_nb = spreadCountOf(count)
+            viewer._images_list_cur = spreadOfPage(src)
+        end
+
+        if mode_changed or G_reader_settings:isTrue(AUTOCROP_KEY) then
+            -- Cropping is skipped while the view is rotated (see renderBounded),
+            -- so with it on the page really does have to be rendered again.
+            reloadCurrentPage()
+        else
+            -- Nothing that changes which buffer this page is: the re-render
+            -- would decode a byte-for-byte identical one. update() re-uses the
+            -- buffer already on hand, re-applies the rotation angle and
+            -- refreshes the button label.
+            viewer:update()
+        end
+    end
+
+    --- Opened by a long press on Rotate. Tap stays a plain toggle because
+    --- rotating is the frequent action; the rest is set once and forgotten.
+    local function showDisplayDialog()
+        local ButtonDialog = require("ui/widget/buttondialog")
+        local dialog
+        dialog = ButtonDialog:new{
+            title = L("Display", "显示方式"),
+            title_align = "center",
+            buttons = {
+                {
+                    {
+                        text = L("Rotate 90°", "旋转 90°"),
+                        callback = function()
+                            UIManager:close(dialog)
+                            toggleRotation()
+                        end,
+                    },
+                },
+                {
+                    {
+                        text = L("Two pages", "双页显示"),
+                        checked_func = dualPageOn,
+                        callback = function()
+                            local src = currentSourcePage()
+                            G_reader_settings:flipNilOrFalse(DUAL_KEY)
+                            -- Chosen by hand, so it outlives this chapter: the
+                            -- entry sync only drops rotation-made values.
+                            G_reader_settings:saveSetting(DUAL_AUTO_KEY, false)
+                            applyDisplayModeChange(src)
+                            -- The two rows below gate on dualPageOn() through
+                            -- enabled_func, which Button evaluates at paint time
+                            -- only for the rows it repaints -- and a tap
+                            -- repaints just its own row. Without this, opening
+                            -- dual mode leaves them greyed out until something
+                            -- else forces a full refresh.
+                            UIManager:setDirty(dialog, "ui")
+                        end,
+                    },
+                },
+                {
+                    {
+                        text = L("Right to left", "从右到左"),
+                        checked_func = dualRtl,
+                        enabled_func = dualPageOn,
+                        callback = function()
+                            G_reader_settings:saveSetting(DUAL_RTL_KEY, not dualRtl())
+                            reloadCurrentPage()
+                        end,
+                    },
+                },
+                {
+                    {
+                        text = L("First page is cover", "首页单独显示"),
+                        checked_func = dualCoverFirst,
+                        enabled_func = dualPageOn,
+                        callback = function()
+                            local src = currentSourcePage()
+                            G_reader_settings:flipNilOrFalse(DUAL_COVER_KEY)
+                            applyDisplayModeChange(src)
+                        end,
+                    },
+                },
+            },
+        }
+        UIManager:show(dialog)
+    end
+
     -- Fill the look-ahead window one page per scheduled callback, so no single
     -- fetch blocks for long and the pending one stays cancellable. The chain
     -- stops on failure and re-arms on the next page turn, which keeps a dead
@@ -744,9 +1071,30 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
     local schedulePrefetch
     local function prefetchNext()
         if closed then return end
+        -- The fetch below is a synchronous HTTP request: it owns the UI thread
+        -- for its whole duration, so anything the reader touches meanwhile just
+        -- queues up. That is exactly the wrong time to hold the thread when a
+        -- dialog is open — the reader is looking at a button, not at the page.
+        -- Stand aside until the viewer is on top again.
+        local stack = UIManager._window_stack
+        local top = stack and stack[#stack]
+        if viewer and top and top.widget ~= viewer then
+            if prefetch_deferrals < PREFETCH_DEFER_MAX then
+                prefetch_deferrals = prefetch_deferrals + 1
+                schedulePrefetch(PREFETCH_DEFER_DELAY)
+            end
+            return
+        end
+        prefetch_deferrals = 0
         local current = viewer._images_list_cur
         if not current then return end
-        local base = current - 1
+        -- The window is counted in source pages, because that is the unit the
+        -- cache and the prefetcher work in. A spread covers two of them, so
+        -- the depth doubles to keep the same number of spreads ready.
+        local first_page = spreadPages(current, count)[1] or current
+        local base = first_page - 1
+        local ahead = dualPageOn() and PREFETCH_AHEAD * 2 or PREFETCH_AHEAD
+        local behind = dualPageOn() and PREFETCH_BEHIND * 2 or PREFETCH_BEHIND
         -- A page already on disk needs no prefetch: it will load quickly
         -- enough on demand, and re-downloading it would waste the network we
         -- are trying to spare.
@@ -756,14 +1104,14 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
                 and not diskCacheHas(pageKey(index))
         end
         local target
-        for offset = 1, PREFETCH_AHEAD do
+        for offset = 1, ahead do
             if needed(base + offset) then
                 target = base + offset
                 break
             end
         end
         if target == nil then
-            for offset = 1, PREFETCH_BEHIND do
+            for offset = 1, behind do
                 if needed(base - offset) then
                     target = base - offset
                     break
@@ -799,7 +1147,10 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
         orig_switch_to_image_num(this, image_num)
         -- A load that had to hit the network was a prefetch miss; retry it
         -- once shortly after, in case the failure was a transient timeout.
-        local index = (image_num or 0) - 1
+        -- image_num is a spread in dual-page mode, and the caches are keyed by
+        -- source page, so map across before looking anything up.
+        local src = spreadPages(image_num or 1, count)[1]
+        local index = src and (src - 1) or -1
         if index >= 0 and cache[index] == nil and not retried[index] then
             retried[index] = true
             UIManager:scheduleIn(2.5, function()
@@ -853,10 +1204,12 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
                     -- id "rotate" is required by ImageViewer:update()
                     id = "rotate",
                     text = viewer.rotated and _("No rotation") or _("Rotate"),
-                    callback = function()
-                        viewer.rotated = not viewer.rotated and true or false
-                        viewer:update()
-                    end,
+                    -- toggleRotation also turns dual-page on and off with the
+                    -- rotation, so it may have to re-pair the pages and redraw.
+                    -- When neither the pairing nor the crop changed, it only
+                    -- re-applies the rotation to the buffer already decoded.
+                    callback = toggleRotation,
+                    hold_callback = showDisplayDialog,
                 },
                 {
                     id = "goto",
@@ -874,8 +1227,12 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
                     callback = function()
                         G_reader_settings:flipNilOrFalse(AUTOCROP_KEY)
                         crop_cache = {} -- the setting changed, so measure again
+                        -- reloadCurrentPage goes through switchToImageNum, which
+                        -- ends in update(); a second update() here would free
+                        -- the widget it just built and resample the same buffer
+                        -- again, plus one more full-screen refresh. The tick in
+                        -- this button's own checkbox is repainted by the tap.
                         reloadCurrentPage()
-                        viewer:update()
                     end,
                 },
                 {
@@ -900,7 +1257,9 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
     if continue then
         self:jumpToPage(viewer, count)
     elseif last_page_read then
-        viewer:switchToImageNum(last_page_read)
+        -- last_page_read is a source page from the catalog; the viewer counts
+        -- spreads once dual-page is on.
+        viewer:switchToImageNum(spreadOfPage(last_page_read))
     else
         -- add 1 since Kavita's Page count is zero based
         -- and ImageViewer is not.
@@ -917,15 +1276,20 @@ end
 
 -- Shows a page number dialog for page streaming.
 function OPDSPSE:jumpToPage(viewer, count)
-    -- Pre-filled with where the reader already is, so this both answers "what
-    -- page am I on" and lets that be adjusted.
+    -- In dual-page mode the viewer's pages are spreads, so this counts spreads
+    -- too: the reader is choosing a position on screen, not a sheet of paper.
+    -- Pre-filled with where they already are, so it answers "which page am I
+    -- on" as well as letting that be changed.
+    local total = spreadCountOf(count)
     local current = viewer and viewer._images_list_cur or 1
     local input_dialog
     input_dialog = InputDialog:new{
-        title = T(L("Page %1 of %2", "第 %1 页，共 %2 页"), current, count),
+        title = dualPageOn()
+            and T(L("Spread %1 of %2", "跨页 %1 / %2"), current, total)
+            or T(L("Page %1 of %2", "第 %1 页，共 %2 页"), current, total),
         input = tostring(current),
         input_type = "number",
-        input_hint = "(" .. "1 - " .. count .. ")",
+        input_hint = "(" .. "1 - " .. total .. ")",
         buttons = {
             {
                 {
@@ -942,7 +1306,7 @@ function OPDSPSE:jumpToPage(viewer, count)
                         local page_num = input_dialog:getInputValue()
                         if page_num then
                             UIManager:close(input_dialog)
-                            viewer:switchToImageNum(math.min(math.max(1, page_num), count))
+                            viewer:switchToImageNum(math.min(math.max(1, page_num), total))
                         end
                     end,
                 },

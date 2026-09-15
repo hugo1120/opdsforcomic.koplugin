@@ -54,13 +54,14 @@ end})
 
 在你看当前页时，后台预取前后几页：
 
-- **内存缓存**：6 页原始字节，先进先出淘汰，关闭阅读界面即清空
+- **内存缓存**：16 MB 原始字节，按「离当前页的距离」淘汰，关闭阅读界面即清空
 - **磁盘缓存**：64 MB 上限，跨重启保留，最久未修改优先淘汰
-- **预取窗口**：当前页之后 2 页、之前 1 页，每次抓一页，翻页后延迟 0.35 秒开始
+- **预取窗口**：当前页之后 3 页、之前 2 页，每次抓一页，翻页后延迟 0.35 秒开始
+- **让路给弹窗**：设置面板或输入框打开时暂停抓取，每 0.5 秒重试一次，最多 20 次——抓取是同步阻塞的，正在找按钮的时候不该冻住界面
 
 只缓存**原始字节**，不缓存解码后的 BlitBuffer。`ImageViewer` 会释放交给它的 BlitBuffer（`page_table.image_disposable = true` 那条路径），如果缓存里存的是同一个对象，翻页时被释放、再命中就是 use-after-free。字节缓存与它持有的对象之间没有别名，原有的释放模型完全不用改动。
 
-预取使用**比翻页更短的超时**（4s/10s，翻页保持原版的 15s/60s）。预取是在你阅读过程中无预警插入的，沿用 60 秒超时会让界面冻结一分钟；超时后该页会在下次翻页时重新抓取。
+预取使用**比翻页更短的超时**（6s/15s，翻页保持原版的 15s/60s）。预取是在你阅读过程中无预警插入的，沿用 60 秒超时会让界面冻结一分钟；超时后该页会在下次翻页时重新抓取。
 
 ### 安装
 
@@ -115,7 +116,7 @@ http://你的服务器:4567/api/opds/v1.2
 | 按钮 | 作用 |
 |---|---|
 | `Scale` / `Original size` | 适屏与原尺寸之间切换 |
-| `Rotate` / `No rotation` | 旋转 90° |
+| `Rotate` / `No rotation` | 旋转 90°，**并自动切换双页跨页**；长按打开显示方式面板 |
 | `Go to` | 打开页码输入框，**已预填当前页**；标题显示「第 N 页，共 M 页」 |
 | `Crop` | 自动裁剪白边的开关，开启后按钮带 ✓ |
 | `Close` | 关闭 |
@@ -127,6 +128,25 @@ http://你的服务器:4567/api/opds/v1.2
 裁剪只在内存里改变显示范围，不改动缓存的原始字节，也不影响预取。开启后日志每页会记一行 `crop 2480x3508 -> 120,180..2360,3320`，`nothing to trim` 表示判定不确信、保持了原样。
 
 > 未实现 TinyPic 的页码裁剪。它必须把页码和「底部居中的小分格」区分开，判错就是静默删掉画面，代价太高。
+
+##### 显示方式（长按 `Rotate`）
+
+长按 `Rotate` 打开设置面板：
+
+| 项 | 作用 |
+|---|---|
+| `Rotate 90°` / 旋转 90° | 同点按；旋转后自动关闭面板 |
+| `Two pages` / 双页显示 | 左右两页并排显示 |
+| `Right to left` / 从右到左 | 双页时第 1 页排在右边（日式漫画的读法，默认开） |
+| `First page is cover` / 首页单独显示 | 第 1 页单独一屏，之后按 (2,3) (4,5)… 配对 |
+
+**旋转与双页是绑在一起的**：转到横屏自动打开双页，转回竖屏自动恢复单页——横屏只看一页漫画没有意义。面板里的「双页显示」仍可手动开启，手动开的值会**跨章节保留**；由旋转带出来的则不会，下次打开章节回到单页。
+
+后两项在双页关闭时置灰，打开双页后立刻可用。**「从右到左」默认开启**，因为这是漫画插件；左开本的书要在这里关掉。
+
+双页是**显示时合成**的：一次解码两个源页、拼成一张宽图再交给 `ImageViewer`，缓存与预取仍然按源页工作，完全不知道双页的存在。配对规则与 KOReader 内置的漫画插件（`comicreader.koplugin`）一致。
+
+**关闭只能靠按钮。** 原版的单指滑动关闭已禁用——在「适应屏幕」缩放下，一次漂移几毫米的点按和短促滑动在电子墨水屏上无法区分，误触会直接退出整章且屏幕上没有任何提示。多指滑动、Back 键（有实体键的机型）和 `Close` 按钮仍然可用。
 
 ### 缓存与可调参数
 
@@ -145,7 +165,9 @@ http://你的服务器:4567/api/opds/v1.2
 local PREFETCH_AHEAD = 3          -- 当前页之后预取几页
 local PREFETCH_BEHIND = 2         -- 当前页之前预取几页（回翻用）
 local PREFETCH_DELAY = 0.35       -- 翻页后延迟多久开始预取（秒）
-local PREFETCH_CHAIN_DELAY = 0.05 -- 预取链上连续抓取的间隔（秒）
+local PREFETCH_CHAIN_DELAY = 0.25 -- 预取链上连续抓取的间隔（秒）
+local PREFETCH_DEFER_DELAY = 0.5  -- 弹窗挡住阅读界面时，隔多久重试（秒）
+local PREFETCH_DEFER_MAX = 20     -- 最多重试几次，之后放弃并等下一次翻页
 
 local MEM_CACHE_MAX_BYTES = 16 * 1024 * 1024  -- 内存缓存上限（字节）
 local MEM_CACHE_MIN_PAGES = 4                 -- 无论如何至少保留几页
@@ -169,6 +191,10 @@ local AUTOCROP_MAX_TRIM = 0.35    -- 单边最多裁掉这个比例
 ```
 
 `AUTOCROP_POWER` 映射到二值化阈值 `240 - power*64`，沿用 TinyPic 的公式但**默认取 0.6 而非 1.0**——裁进网点比留条白边糟得多。
+
+**`PREFETCH_CHAIN_DELAY` 从 0.05 提到 0.25。** 链上每一步都是一次同步抓取、独占 UI 线程，几毫秒的间隔等于翻页后连续几百毫秒的输入无响应——而那正是读者最可能去点东西的时刻。填窗速度取决于网络而不是这个定时器，所以多这 0.2 秒几乎不影响填窗，却给点击留出了缝。
+
+**双页时预取窗口按源页翻倍。** 一个跨页覆盖两个源页，深度加倍才能保持同样多的跨页就绪。
 
 **为什么向前是 3、向后是 2：** 顺序阅读时每次翻页恒定只需要新抓 1 页——窗口里其余都在缓存里。所以 `PREFETCH_AHEAD` 设 2 还是 3，**稳态网络负载完全一样**，差别只是缓冲深度：网络抖动时你有多大余量不被追上。向后则是跳着回看的保险。
 
@@ -206,12 +232,23 @@ opdsforcomic: page 45: ready in 2310 ms via net
 ### 已知限制
 
 - **会推进服务端阅读进度。** Suwayomi 的 PSE 模板带 `updateProgress=true`，预取页也会计入。若不希望如此，可在 `fetchPageData` 中把预取请求的该参数改写为 `false`（未默认启用，因为 URL 改写不通用）。
-- **预取是阻塞式的。** KOReader 没有线程池，预取在主线程执行，超时为 4s/10s，最坏情况卡顿上限 10 秒。彻底的解法是用 `socket.select` 做分片非阻塞下载，尚未实现。
+- **预取是阻塞式的。** KOReader 没有线程池，预取在主线程执行，超时为 6s/15s，最坏情况卡顿上限 15 秒。打开对话框时预取会主动让路（见上），但翻页路径本身仍然是同步的。彻底的解法是用 `socket.select` 做分片非阻塞下载，尚未实现。
 - **不继承上游更新。** 这是完整 fork，KOReader 对 `opds.koplugin` 的修复不会自动流入，升级后需手动重新合并。
 - **保留的原版行为**：Kavita 专用进度查询（`getLastPage`）对 Suwayomi 等非 Kavita 服务器会直接抛错并被 `pcall` 兜底为 0，因此始终从第 1 页开始。
 - **未实现 HTTP 连接复用。** 目前每页新建一次 TCP 连接。`socketutil.lua` 的注释指出，用自定义 `create` 函数处理 HTTPS 连接复用很容易出问题，因此没有贸然改动。
 
 ### 更新日志
+
+**0.0.4**
+
+- 新增**双页跨页显示**：左右两页并排，可切「从右到左」（默认开，这是漫画）与「首页单独显示」。配对规则取自内置的 `comicreader.koplugin`。双页只在**显示时合成**——一次解码两个源页、拼成一张宽图，缓存与预取仍按源页工作。
+- 新增**长按 `Rotate` 的显示方式面板**：旋转、双页、阅读方向、首页是否单独显示。后两项在双页关闭时置灰。
+- **旋转与双页绑定**：转横屏自动开双页，转竖屏自动恢复单页。手动开的双页跨章节保留，由旋转带出来的不保留——否则下次打开章节会「没旋转却双页」。
+- **关掉单指滑动关闭。** 在「适应屏幕」缩放下，几毫米的滑动与点按在电子墨水屏上无法区分，误触会静默退出整章。`Close` 按钮、Back 键、多指滑动仍然可用。
+- **修掉旋转时的一次多余重解码。** 裁剪关闭（默认）时旋转不再重渲染整页，直接复用已解码的缓冲，只重算旋转角；裁剪开启时才需要重渲染，因为旋转态会跳过裁剪。裁剪开关本身也不再渲染两遍。
+- **修掉内存淘汰的方向错误。** 淘汰想丢掉离读者最远的页，却拿跨页号当源页号算距离；双页时这个偏差把基准挪到了读者身后，于是优先丢掉的是**前方还没读**的页。表现是往前翻反而要重新下载。
+- **预取给对话框让路。** 抓取是同步阻塞的，面板或输入框开着时此前会连界面一起冻住。现在暂停抓取、每 0.5 秒重试，最多约 10 秒；翻页会重新起链。
+- 预取链的间隔 0.05 → 0.25 秒，让出 UI 线程；填窗速度取决于网络，几乎不受影响。
 
 **0.0.3**
 
@@ -293,13 +330,14 @@ Hiding that wait behind the reading itself, so a page turn only has to decode, i
 
 While you read the current page, neighbouring pages are fetched in the background:
 
-- **Memory cache**: six pages of raw bytes, oldest evicted first, cleared when the viewer closes
+- **Memory cache**: 16 MB of raw bytes, evicted by distance from the current page, cleared when the viewer closes
 - **Disk cache**: 64 MB cap, survives restarts, oldest files evicted first
-- **Prefetch window**: two pages ahead, one behind, one page per fetch, starting 0.35 s after a page turn
+- **Prefetch window**: three pages ahead, two behind, one page per fetch, starting 0.35 s after a page turn
+- **Yields to dialogs**: fetching pauses while a panel or input box is open and retries every 0.5 s, up to 20 times — the fetch is synchronous, and the moment you are reaching for a button is the wrong moment to freeze the UI
 
 Only **raw bytes** are cached, never decoded BlitBuffers. The `ImageViewer` frees whatever buffer it is handed (the `page_table.image_disposable = true` path), so caching those would mean handing it a buffer that had already been freed. Raw bytes are not aliased with anything the viewer owns, which leaves the existing disposal model untouched.
 
-Prefetches use **shorter timeouts than page turns** (4 s / 10 s, against the stock 15 s / 60 s). A prefetch runs unannounced while you are reading, so the stock timeout would freeze the UI for a minute; a page that times out here is simply fetched again on the next page turn.
+Prefetches use **shorter timeouts than page turns** (6 s / 15 s, against the stock 15 s / 60 s). A prefetch runs unannounced while you are reading, so the stock timeout would freeze the UI for a minute; a page that times out here is simply fetched again on the next page turn.
 
 ### Installation
 
@@ -354,7 +392,7 @@ Tap the middle third of the screen to bring up the bottom button bar:
 | Button | What it does |
 |---|---|
 | `Scale` / `Original size` | Toggle between fit-to-screen and native size |
-| `Rotate` / `No rotation` | Rotate by 90° |
+| `Rotate` / `No rotation` | Rotate by 90°, **and switch dual-page spreads with it**; long-press opens the display panel |
 | `Go to` | Opens a page-number dialog, **pre-filled with the current page**, titled "Page N of M" |
 | `Crop` | Toggles automatic margin trimming; shows a ✓ when on |
 | `Close` | Close the viewer |
@@ -366,6 +404,23 @@ The approach is taken from TinyPic / Kindle Comic Converter: detect the backgrou
 Cropping only changes what region is displayed in memory. It does not touch the cached bytes and does not affect prefetching. With it on, the log gains a line per page — `crop 2480x3508 -> 120,180..2360,3320`, or `nothing to trim` when the estimate was not convincing.
 
 > TinyPic's page-number pass is not implemented. Telling a page number apart from a small panel at the bottom centre is exactly the kind of guess that silently deletes artwork.
+
+##### Display options (long-press `Rotate`)
+
+| Item | What it does |
+|---|---|
+| `Rotate 90°` | Same as a tap; closes the panel afterwards |
+| `Two pages` | Show two pages side by side |
+| `Right to left` | Puts the first page on the right in two-page mode (the manga convention, on by default) |
+| `First page is cover` | Page 1 gets a screen to itself; later spreads are (2,3) (4,5)… |
+
+**Rotation and dual-page are tied together**: going landscape turns two-page mode on, returning to portrait turns it off — a single page sideways is pointless. The panel's `Two pages` row still works by hand, and a by-hand choice **carries over between chapters**; a rotation-made one does not, so the next chapter opens single-page.
+
+The last two rows are greyed out while two-page mode is off and become usable the moment it is on. **`Right to left` is on by default** because this is a manga plugin; turn it off for left-bound books.
+
+Two-page mode is **composited at display time**: two source pages are decoded and stitched into one wide buffer before the viewer sees it, so the cache and the prefetcher keep working in source pages and never learn that two of them are on screen. The pairing rules come from KOReader's bundled comic plugin, `comicreader.koplugin`.
+
+**Closing is the button's job.** The stock one-finger swipe-to-close is disabled: at "scaled for best fit" a tap that drifts a few millimetres is indistinguishable from a short flick on e-ink, and a misread silently drops the whole chapter with nothing on screen to explain it. A multiswipe, the Back key (on devices that have one) and `Close` all still work.
 
 ### Caching and Tuning
 
@@ -384,7 +439,9 @@ The knobs live at the top of `opdsforcomic_pse.lua`:
 local PREFETCH_AHEAD = 3          -- pages to keep ready ahead of the current one
 local PREFETCH_BEHIND = 2         -- pages to keep ready behind it, for turning back
 local PREFETCH_DELAY = 0.35       -- seconds to wait after a page turn before fetching
-local PREFETCH_CHAIN_DELAY = 0.05 -- seconds between successive fetches while filling
+local PREFETCH_CHAIN_DELAY = 0.25 -- seconds between successive fetches while filling
+local PREFETCH_DEFER_DELAY = 0.5  -- seconds to wait before retrying while a dialog is up
+local PREFETCH_DEFER_MAX = 20     -- give up after this many retries; the next turn re-arms it
 
 local MEM_CACHE_MAX_BYTES = 16 * 1024 * 1024  -- memory cache cap, in bytes
 local MEM_CACHE_MIN_PAGES = 4                 -- pages kept regardless of the cap
@@ -408,6 +465,10 @@ local AUTOCROP_MAX_TRIM = 0.35    -- never cut more than this off one side
 ```
 
 `AUTOCROP_POWER` maps to a binarisation threshold of `240 - power*64`, TinyPic's formula, but defaulted to **0.6 rather than their 1.0**: cropping into a screentone is far worse than leaving a margin behind.
+
+**`PREFETCH_CHAIN_DELAY` went from 0.05 to 0.25.** Every step of the chain is a synchronous fetch that owns the UI thread, so a few milliseconds between steps meant several hundred milliseconds of dead input right after each page turn — the moment the reader is most likely to tap something. The window fills at the speed of the link, not of this timer, so the extra quarter second costs almost nothing and leaves a gap for a tap to be served in.
+
+**In two-page mode the window doubles, counted in source pages.** One spread covers two of them, so the depth doubles to keep the same number of spreads ready.
 
 **Why 3 ahead and 2 behind.** Reading forwards consumes one prefetched page per turn and fetches exactly one new one, so in steady state `PREFETCH_AHEAD = 2` and `3` cost the same bandwidth — the difference is only how much slack there is before the reader outruns the link. Depth behind is insurance for jumping backwards past what is still cached.
 
@@ -443,12 +504,23 @@ The `via` field tells you whether caching is working: `mem` and `disk` are hits,
 ### Known Limitations
 
 - **It advances server-side reading progress.** Suwayomi's PSE template carries `updateProgress=true`, and prefetched pages count. To avoid it, rewrite that parameter to `false` for prefetch requests in `fetchPageData` (not enabled by default, since rewriting URLs is not portable across servers).
-- **Prefetching is blocking.** KOReader has no thread pool, so prefetches run on the main thread. Timeouts are 4 s / 10 s, bounding the worst-case stall at ten seconds. The thorough fix is chunked non-blocking downloads with `socket.select`, not implemented.
+- **Prefetching is blocking.** KOReader has no thread pool, so prefetches run on the main thread. Timeouts are 6 s / 15 s, bounding the worst-case stall at fifteen seconds. A prefetch now stands aside while a dialog is open (see above), but the page-turn path itself is still synchronous. The thorough fix is chunked non-blocking downloads with `socket.select`, not implemented.
 - **Upstream fixes do not flow in.** This is a full fork; KOReader's fixes to `opds.koplugin` will not arrive automatically and must be merged by hand.
 - **Inherited behaviour**: the Kavita-specific progress lookup (`getLastPage`) throws on non-Kavita servers such as Suwayomi and is caught by `pcall`, so streaming always starts at page 1.
 - **No HTTP connection reuse.** Each page opens a new TCP connection. The comment in `socketutil.lua` warns that connection reuse via a custom `create` function is error-prone under HTTPS, so it was left alone.
 
 ### Changelog
+
+**0.0.4**
+
+- Added **dual-page spreads**: two pages side by side, with `Right to left` (on by default — this is manga) and `First page is cover`. The pairing rules come from the bundled `comicreader.koplugin`. Two-page mode is **composited at display time** — two source pages are decoded and stitched into one wide buffer — so the cache and the prefetcher keep working in source pages.
+- Added a **display panel on a long press of `Rotate`**: rotation, two-page mode, reading direction, and whether the first page stands alone. The last two rows are greyed out while two-page mode is off.
+- **Rotation and dual-page are tied together**: landscape turns two-page mode on, portrait turns it off. A by-hand choice carries over between chapters; a rotation-made one does not — otherwise the next chapter would open two-page while upright.
+- **Disabled one-finger swipe-to-close.** At "scaled for best fit" a tap that drifts a few millimetres is indistinguishable from a short flick on e-ink, and a misread silently drops the whole chapter. `Close`, the Back key and a multiswipe all still work.
+- **Removed a wasted re-decode on rotate.** With cropping off (the default) rotating no longer re-renders the page — the decoded buffer is reused and only the angle is recomputed. With cropping on it still has to, because a rotated view skips the crop. The Crop toggle no longer renders the page twice either.
+- **Fixed the direction of memory eviction.** Eviction meant to drop the pages furthest from the reader but measured distance with a spread number where a source-page number belongs; in two-page mode that put the origin behind the reader, so it preferentially dropped the pages **ahead** of them. The symptom was re-downloading when turning forwards.
+- **Prefetching yields to dialogs.** The fetch is synchronous, so an open panel or input box used to freeze the UI along with it. It now pauses and retries every 0.5 s, up to about ten seconds; a page turn re-arms the chain.
+- The prefetch chain's step delay went from 0.05 s to 0.25 s, giving the UI thread room to breathe. The window fills at the speed of the link, so this costs almost nothing.
 
 **0.0.3**
 
