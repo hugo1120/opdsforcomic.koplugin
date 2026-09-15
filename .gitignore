@@ -6,3 +6,8 @@ desktop.ini
 # Editor
 *.swp
 *~
+
+# Release packaging artefacts
+/opdsforcomic.koplugin/
+/opdsforcomic.koplugin-*.zip
+/opdsforcomic.koplugin.zip

@@ -42,21 +42,40 @@ an already-freed one.
 ]]
 
 --- Number of pages kept ready ahead of / behind the current page.
-local PREFETCH_AHEAD = 2
-local PREFETCH_BEHIND = 1
---- How long to wait after a page turn before fetching, in seconds.
+---
+--- Depth ahead is nearly free in steady state: reading forwards consumes one
+--- prefetched page per turn and fetches exactly one new one, so 2 and 3 cost
+--- the same bandwidth and differ only in how much slack there is before the
+--- reader outruns the link. Depth behind is insurance for jumping backwards
+--- past what is still cached.
+local PREFETCH_AHEAD = 3
+local PREFETCH_BEHIND = 2
+--- How long to wait after a page turn before fetching, in seconds. Lets the
+--- e-ink refresh settle before the UI thread blocks on a fetch.
 local PREFETCH_DELAY = 0.35
---- Pages of raw bytes held in memory at once.
-local MEM_CACHE_LIMIT = 6
---- Prefetch timeouts, in seconds. Much shorter than the ones used for a
---- user-initiated page turn: a prefetch runs while the reader is looking at
---- another page, so a stalled request must not freeze the UI for long. A
---- page that times out here is simply fetched again on a real page turn.
-local PREFETCH_BLOCK_TIMEOUT = 4
-local PREFETCH_TOTAL_TIMEOUT = 10
+--- Delay between successive fetches while filling the window. Much shorter
+--- than PREFETCH_DELAY: that delay exists to let a page turn settle, and
+--- paying it again between chain steps just means the window fills slower
+--- than the link allows, so the reader outruns it.
+local PREFETCH_CHAIN_DELAY = 0.05
+--- Memory cache bound, in bytes rather than pages, so a server with large
+--- pages keeps fewer of them instead of quietly eating memory. MIN_PAGES is
+--- the floor that keeps it usable even when a single page is huge.
+local MEM_CACHE_MAX_BYTES = 16 * 1024 * 1024
+local MEM_CACHE_MIN_PAGES = 4
+--- Prefetch timeouts, in seconds. Shorter than the ones used for a
+--- user-initiated page turn, because a prefetch blocks the UI unannounced
+--- while the reader is looking at another page — but not so short that a
+--- merely slow page gets killed and fetched twice.
+local PREFETCH_BLOCK_TIMEOUT = 6
+local PREFETCH_TOTAL_TIMEOUT = 15
 
---- On-disk page cache. Survives restarts; harmless to disable.
-local DISK_CACHE_ENABLED = true
+--- On-disk page cache. Off by default: writing a page to the SD card is
+--- synchronous and sits on the page-turn path, which costs more than it
+--- saves unless the reader actually revisits chapters. Measured logs showed
+--- zero disk hits in a normal session. Turn it on if you re-read chapters
+--- and would rather pay at fetch time than at open time.
+local DISK_CACHE_ENABLED = false
 local DISK_CACHE_SUBDIR = "opdsforcomic_pse"
 local DISK_CACHE_MAX_BYTES = 64 * 1024 * 1024
 --- Pages already on disk are trusted only for this long, in seconds.
@@ -329,30 +348,63 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
 
     -- Raw image bytes, keyed by 0-based page index (ImageViewer page numbers
     -- are 1-based, so index == key - 1, as elsewhere in this file).
-    local cache, cache_order = {}, {}
+    -- Declared here, assigned after ImageViewer:new below, because the cache
+    -- helpers need to know the current page and are defined before it. Without
+    -- this forward declaration they would read a *global* named viewer, which
+    -- is always nil — Lua locals only come into scope at their declaration.
+    local viewer
+
+    local cache = {}
+    local cache_bytes = 0
     local closed = false
     local retried = {}
     local last_failure_notice = 0
 
-    local function cacheStore(index, data)
-        if cache[index] == nil then
-            table.insert(cache_order, index)
-        end
-        cache[index] = data
-        while #cache_order > MEM_CACHE_LIMIT do
-            cache[table.remove(cache_order, 1)] = nil
+    local function cacheCount()
+        local n = 0
+        for _ in pairs(cache) do n = n + 1 end
+        return n
+    end
+
+    --- Evicts whatever is furthest from the page being read.
+    ---
+    --- Distance, not insertion order: the prefetcher fills forwards first and
+    --- backwards second, so evicting oldest-first would drop exactly the pages
+    --- the reader is about to need and keep the ones already behind them.
+    --- MIN_PAGES keeps the cache usable even if one page exceeds the byte cap.
+    local function cacheEvict()
+        while cache_bytes > MEM_CACHE_MAX_BYTES and cacheCount() > MEM_CACHE_MIN_PAGES do
+            -- viewer is still nil while ImageViewer's constructor loads the
+            -- very first page; treat that as being on page 0.
+            local current = (viewer and viewer._images_list_cur or 1) - 1
+            local worst, worst_dist
+            for index, data in pairs(cache) do
+                local dist = math.abs(index - current)
+                if worst == nil or dist > worst_dist then
+                    worst, worst_dist = index, dist
+                end
+            end
+            if worst == nil then return end
+            cache_bytes = cache_bytes - #cache[worst]
+            cache[worst] = nil
         end
     end
 
+    local function cacheStore(index, data)
+        local previous = cache[index]
+        if previous then
+            cache_bytes = cache_bytes - #previous
+        end
+        cache[index] = data
+        cache_bytes = cache_bytes + #data
+        cacheEvict()
+    end
+
     local function cacheDrop(index)
-        if cache[index] ~= nil then
+        local data = cache[index]
+        if data then
+            cache_bytes = cache_bytes - #data
             cache[index] = nil
-            for i, v in ipairs(cache_order) do
-                if v == index then
-                    table.remove(cache_order, i)
-                    break
-                end
-            end
         end
     end
 
@@ -427,7 +479,12 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
     end
 
     local page_table = {image_disposable = true}
-    setmetatable(page_table, {__index = function (_, key)
+    -- NOTE: the first parameter must not be named `_`. In this file `_` is
+    -- gettext, and a parameter of that name shadows it, so the error paths
+    -- below would call a table instead of translating a string and crash
+    -- KOReader. Upstream has the same trap at opdspse.lua:106; it is only
+    -- reachable there on an invalid protocol, which is why it went unnoticed.
+    setmetatable(page_table, {__index = function (_page_table, key)
         if type(key) ~= "number" then
             return RenderImage:renderImageFile("resources/koreader.png", false)
         end
@@ -458,7 +515,7 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
     end})
 
     local ImageViewer = require("ui/widget/imageviewer")
-    local viewer = ImageViewer:new{
+    viewer = ImageViewer:new{
         image = page_table,
         fullscreen = true,
         with_title_bar = false,
@@ -513,12 +570,22 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
         if data then
             cacheStore(target, data)
             diskCachePut(pageKey(target), data)
-            schedulePrefetch()
+            if cache[target] == nil then
+                -- Stored and evicted in the same breath: the look-ahead window
+                -- does not fit in the memory cache. Carrying on would refetch
+                -- the same pages forever, so stop and let page turns re-arm.
+                log("prefetch window exceeds memory cache (%d bytes), stopping chain",
+                    cache_bytes)
+                return
+            end
+            schedulePrefetch(PREFETCH_CHAIN_DELAY)
         end
     end
-    schedulePrefetch = function()
+    --- Called with no argument after a page turn (settle first), and with
+    --- PREFETCH_CHAIN_DELAY from the chain itself (keep filling).
+    schedulePrefetch = function(delay)
         UIManager:unschedule(prefetchNext)
-        UIManager:scheduleIn(PREFETCH_DELAY, prefetchNext)
+        UIManager:scheduleIn(delay or PREFETCH_DELAY, prefetchNext)
     end
 
     -- Re-arm the look-ahead on every page turn, including the initial one.
@@ -546,7 +613,7 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
     viewer.onCloseWidget = function(this, ...)
         closed = true
         UIManager:unschedule(prefetchNext)
-        cache, cache_order = {}, {}
+        cache, cache_bytes = {}, 0
         return orig_on_close_widget(this, ...)
     end
 

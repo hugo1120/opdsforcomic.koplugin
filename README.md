@@ -21,6 +21,7 @@ An OPDS client plugin for KOReader, adding page prefetching and two-level cachin
 - [缓存与可调参数](#缓存与可调参数)
 - [日志](#日志)
 - [已知限制](#已知限制)
+- [更新日志](#更新日志)
 - [许可](#许可)
 - [English](#english)
 
@@ -63,10 +64,11 @@ end})
 
 ### 安装
 
-1. 下载本仓库（`Code` → `Download ZIP`）
-2. 解压后得到名为 `opdsforcomic.koplugin-main` 的文件夹
-3. **重命名为 `opdsforcomic.koplugin`**（KOReader 靠目录名识别插件，名字不对不会被加载）
-4. 放进 KOReader 的 `plugins/` 目录：
+**方式一：下载 Release（推荐，解压即用）**
+
+1. 到 [Releases](https://github.com/hugo1120/opdsforcomic.koplugin/releases) 下载最新的 `opdsforcomic.koplugin.zip`
+2. 解压，得到 `opdsforcomic.koplugin` 文件夹——**名字已经是对的，不用改**
+3. 整个文件夹放进 KOReader 的 `plugins/` 目录：
 
    | 设备 | 路径 |
    |---|---|
@@ -75,7 +77,14 @@ end})
    | Android | `/sdcard/koreader/plugins/` |
    | Linux 桌面 | `~/.config/koreader/plugins/` |
 
-5. 完全退出 KOReader 再启动（插件只在启动时扫描）
+4. 完全退出 KOReader 再启动（插件只在启动时扫描）
+
+**方式二：从源码仓库下载**
+
+1. 下载本仓库（`Code` → `Download ZIP`）
+2. 解压后得到名为 `opdsforcomic.koplugin-main` 的文件夹
+3. **重命名为 `opdsforcomic.koplugin`**（KOReader 靠目录名识别插件，名字不对不会被加载）
+4. 放进 `plugins/` 目录，重启
 
 **注意别多套一层**（`opdsforcomic.koplugin/opdsforcomic.koplugin/main.lua` 是错的）。
 
@@ -103,27 +112,39 @@ http://你的服务器:4567/api/opds/v1.2
 
 | | 位置 | 上限 | 生命周期 |
 |---|---|---|---|
-| 内存缓存 | RAM，原始字节 | 6 页 | 关闭阅读界面即清空 |
-| 磁盘缓存 | `<数据目录>/cache/opdsforcomic_pse/` | 64 MB | 跨重启保留，30 天过期 |
+| 内存缓存 | RAM，原始字节 | 16 MB（约 18 页） | 关闭阅读界面即清空 |
+| 磁盘缓存 | `<数据目录>/cache/opdsforcomic_pse/` | 64 MB | 默认**关闭** |
 
-读取顺序是**内存 → 磁盘 → 网络**。磁盘缓存的文件名是页面 URL 模板加页号的哈希，所以不同章节、不同服务器不会互相覆盖。淘汰检查在打开章节 5 秒后由后台任务执行，不阻塞打开。
+读取顺序是**内存 → 磁盘 → 网络**。
+
+**磁盘缓存默认关闭。** 写一页到 SD 卡是同步操作，且位于翻页路径上——而实测日志里它的命中率是 0。除非你经常退出重进同一章，否则它是纯成本。要开启就把 `DISK_CACHE_ENABLED` 改成 `true`；文件名是页面 URL 模板加页号的哈希，不同章节、不同服务器不会互相覆盖，淘汰检查在打开章节 5 秒后由后台任务执行，不阻塞打开。
 
 参数都在 `opdsforcomic_pse.lua` 开头：
 
 ```lua
-local PREFETCH_AHEAD = 2          -- 当前页之后预取几页
-local PREFETCH_BEHIND = 1         -- 当前页之前预取几页（回翻用）
+local PREFETCH_AHEAD = 3          -- 当前页之后预取几页
+local PREFETCH_BEHIND = 2         -- 当前页之前预取几页（回翻用）
 local PREFETCH_DELAY = 0.35       -- 翻页后延迟多久开始预取（秒）
-local MEM_CACHE_LIMIT = 6         -- 内存缓存上限（页数）
-local PREFETCH_BLOCK_TIMEOUT = 4  -- 预取的单次读取超时（秒）
-local PREFETCH_TOTAL_TIMEOUT = 10 -- 预取的总超时（秒）
+local PREFETCH_CHAIN_DELAY = 0.05 -- 预取链上连续抓取的间隔（秒）
 
-local DISK_CACHE_ENABLED = true   -- 关掉即退回纯内存缓存
+local MEM_CACHE_MAX_BYTES = 16 * 1024 * 1024  -- 内存缓存上限（字节）
+local MEM_CACHE_MIN_PAGES = 4                 -- 无论如何至少保留几页
+
+local PREFETCH_BLOCK_TIMEOUT = 6  -- 预取的单次读取超时（秒）
+local PREFETCH_TOTAL_TIMEOUT = 15 -- 预取的总超时（秒）
+
+local DISK_CACHE_ENABLED = false  -- 默认关闭，见下
 local DISK_CACHE_MAX_BYTES = 64 * 1024 * 1024
 local DISK_CACHE_MAX_AGE = 30 * 24 * 60 * 60  -- 秒
 
 local MAX_DECODE_SCALE = 0        -- 0 = 关闭，见下
 ```
+
+**为什么向前是 3、向后是 2：** 顺序阅读时每次翻页恒定只需要新抓 1 页——窗口里其余都在缓存里。所以 `PREFETCH_AHEAD` 设 2 还是 3，**稳态网络负载完全一样**，差别只是缓冲深度：网络抖动时你有多大余量不被追上。向后则是跳着回看的保险。
+
+**内存按字节封顶而非按页数**，所以大页的服务器自动少存几页，不会悄悄吃内存。实测页大小约 875 KB 时，16 MB 能放约 18 页；页约 3 MB 时约 5 页，会贴近 `MEM_CACHE_MIN_PAGES` 下限。
+
+**淘汰按「离当前页的距离」而非插入顺序。** 预取是先抓前、后抓后，若按插入顺序淘汰，内存紧张时会先把最该留的前向页挤掉。
 
 **内存占用** = `MEM_CACHE_LIMIT` × 单页大小。若页面很大（>2 MB），建议降到 3~4。
 
@@ -160,6 +181,24 @@ opdsforcomic: page 45: ready in 2310 ms via net
 - **保留的原版行为**：Kavita 专用进度查询（`getLastPage`）对 Suwayomi 等非 Kavita 服务器会直接抛错并被 `pcall` 兜底为 0，因此始终从第 1 页开始。
 - **未实现 HTTP 连接复用。** 目前每页新建一次 TCP 连接。`socketutil.lua` 的注释指出，用自定义 `create` 函数处理 HTTPS 连接复用很容易出问题，因此没有贸然改动。
 
+### 更新日志
+
+**0.0.2**
+
+- **修复一个会让 KOReader 崩溃的 bug。** `__index` 元方法的第一个参数名叫 `_`，遮蔽了本文件里的 gettext 函数，于是任何一页加载失败时都会走进 `_("...")` 而崩溃（`attempt to call local '_' (a table value)`）。上游 `opdspse.lua:106` 有同样的坑，但只在「协议非法」这种罕见分支可达；本插件在失败路径上加了提示，才把它变成常见路径。
+- **流畅度大幅提升。** 预取超时从 4s/10s 放宽到 6s/15s。之前慢页会被超时误杀、2.5 秒后再重试一次，等于抓两遍。设备实测：单次抓取最慢耗时从 3–4 秒降到 **785 ms**，波动收窄一个量级。
+- **内存缓存改为按字节封顶**（16 MB），大页服务器自动少存几页，不再按固定页数。
+- **淘汰策略改为按「离当前页的距离」**，而非插入顺序——后者在内存紧张时会先挤掉最该保留的前向页。
+- 向前预取 2 → 3 页，向后 1 → 2 页。
+- 预取链上连续抓取不再重复等待 0.35 秒（新增 `PREFETCH_CHAIN_DELAY`），窗口填满更快。
+- **磁盘缓存默认关闭。** 写一页到 SD 卡是同步操作且位于翻页路径上，而实测命中率为 0，是纯成本。
+- 新增保护：预取窗口装不下内存缓存时停止链条，避免无限重复抓取。
+- Release 压缩包现在自带 `opdsforcomic.koplugin` 文件夹，解压即用，**不需要重命名**。
+
+**0.0.1**
+
+- 初始测试版本。
+
 ### 许可
 
 **AGPL-3.0**（GNU Affero General Public License v3.0），全文见 [LICENSE](LICENSE)。
@@ -184,6 +223,7 @@ AGPL 与 GPL 的关键差别在**第 13 条**：如果你把修改后的版本�
 - [Caching and Tuning](#caching-and-tuning)
 - [Logging](#logging)
 - [Known Limitations](#known-limitations)
+- [Changelog](#changelog)
 - [License](#license)
 - [中文](#中文)
 
@@ -226,10 +266,11 @@ Prefetches use **shorter timeouts than page turns** (4 s / 10 s, against the sto
 
 ### Installation
 
-1. Download this repository (`Code` → `Download ZIP`)
-2. Unzip; you get a folder named `opdsforcomic.koplugin-main`
-3. **Rename it to `opdsforcomic.koplugin`** — KOReader identifies plugins by directory name and will not load it otherwise
-4. Move it into KOReader's `plugins/` directory:
+**Option 1: the release archive (recommended — unzip and drop in)**
+
+1. Grab the latest `opdsforcomic.koplugin.zip` from [Releases](https://github.com/hugo1120/opdsforcomic.koplugin/releases)
+2. Unzip; you get an `opdsforcomic.koplugin` folder — **already named correctly, nothing to rename**
+3. Move that folder into KOReader's `plugins/` directory:
 
    | Device | Path |
    |---|---|
@@ -238,7 +279,14 @@ Prefetches use **shorter timeouts than page turns** (4 s / 10 s, against the sto
    | Android | `/sdcard/koreader/plugins/` |
    | Linux desktop | `~/.config/koreader/plugins/` |
 
-5. Quit and relaunch KOReader — plugins are only scanned at startup
+4. Quit and relaunch KOReader — plugins are only scanned at startup
+
+**Option 2: the source repository**
+
+1. Download this repository (`Code` → `Download ZIP`)
+2. Unzip; you get a folder named `opdsforcomic.koplugin-main`
+3. **Rename it to `opdsforcomic.koplugin`** — KOReader identifies plugins by directory name and will not load it otherwise
+4. Move it into `plugins/` and relaunch
 
 **Do not nest it** (`opdsforcomic.koplugin/opdsforcomic.koplugin/main.lua` is wrong).
 
@@ -266,29 +314,39 @@ You can also bind it to a gesture: Settings → Gestures → File manager → se
 
 | | Location | Cap | Lifetime |
 |---|---|---|---|
-| Memory cache | RAM, raw bytes | 6 pages | Cleared when the viewer closes |
-| Disk cache | `<data dir>/cache/opdsforcomic_pse/` | 64 MB | Survives restarts, 30-day expiry |
+| Memory cache | RAM, raw bytes | 16 MB (about 18 pages) | Cleared when the viewer closes |
+| Disk cache | `<data dir>/cache/opdsforcomic_pse/` | 64 MB | **Off** by default |
 
-Lookups go **memory → disk → network**. On-disk filenames are a hash of the page-URL template plus the page index, so different chapters and servers cannot collide. Eviction runs five seconds after a chapter opens, so opening never waits on a directory walk.
+Lookups go **memory → disk → network**.
+
+**The disk cache is off by default.** Writing a page to the SD card is synchronous and sits on the page-turn path, while device logs showed a zero hit rate. It is pure cost unless you routinely quit and re-open the same chapter. To enable it, set `DISK_CACHE_ENABLED = true`; on-disk filenames are a hash of the page-URL template plus the page index, so different chapters and servers cannot collide, and eviction runs five seconds after a chapter opens so opening never waits on a directory walk.
 
 The knobs live at the top of `opdsforcomic_pse.lua`:
 
 ```lua
-local PREFETCH_AHEAD = 2          -- pages to keep ready ahead of the current one
-local PREFETCH_BEHIND = 1         -- pages to keep ready behind it, for turning back
+local PREFETCH_AHEAD = 3          -- pages to keep ready ahead of the current one
+local PREFETCH_BEHIND = 2         -- pages to keep ready behind it, for turning back
 local PREFETCH_DELAY = 0.35       -- seconds to wait after a page turn before fetching
-local MEM_CACHE_LIMIT = 6         -- pages of raw bytes held in memory
-local PREFETCH_BLOCK_TIMEOUT = 4  -- per-read timeout for a prefetch, in seconds
-local PREFETCH_TOTAL_TIMEOUT = 10 -- total timeout for a prefetch, in seconds
+local PREFETCH_CHAIN_DELAY = 0.05 -- seconds between successive fetches while filling
 
-local DISK_CACHE_ENABLED = true   -- disable to fall back to memory only
+local MEM_CACHE_MAX_BYTES = 16 * 1024 * 1024  -- memory cache cap, in bytes
+local MEM_CACHE_MIN_PAGES = 4                 -- pages kept regardless of the cap
+
+local PREFETCH_BLOCK_TIMEOUT = 6  -- per-read timeout for a prefetch, in seconds
+local PREFETCH_TOTAL_TIMEOUT = 15 -- total timeout for a prefetch, in seconds
+
+local DISK_CACHE_ENABLED = false  -- see above
 local DISK_CACHE_MAX_BYTES = 64 * 1024 * 1024
 local DISK_CACHE_MAX_AGE = 30 * 24 * 60 * 60  -- seconds
 
 local MAX_DECODE_SCALE = 0        -- 0 disables it; see below
 ```
 
-**Memory held** is `MEM_CACHE_LIMIT` times the page size. For large pages (over 2 MB) consider dropping it to 3–4.
+**Why 3 ahead and 2 behind.** Reading forwards consumes one prefetched page per turn and fetches exactly one new one, so in steady state `PREFETCH_AHEAD = 2` and `3` cost the same bandwidth — the difference is only how much slack there is before the reader outruns the link. Depth behind is insurance for jumping backwards past what is still cached.
+
+**The cap is in bytes, not pages**, so a server with large pages simply keeps fewer of them instead of quietly eating memory. At the ~875 KB pages seen in testing, 16 MB holds about 18 pages; at ~3 MB pages it holds about 5 and sits near the `MEM_CACHE_MIN_PAGES` floor.
+
+**Eviction is by distance from the current page, not insertion order.** The prefetcher fills forwards first and backwards second, so evicting oldest-first would drop exactly the pages the reader is about to need.
 
 #### About `MAX_DECODE_SCALE`
 
@@ -322,6 +380,24 @@ The `via` field tells you whether caching is working: `mem` and `disk` are hits,
 - **Upstream fixes do not flow in.** This is a full fork; KOReader's fixes to `opds.koplugin` will not arrive automatically and must be merged by hand.
 - **Inherited behaviour**: the Kavita-specific progress lookup (`getLastPage`) throws on non-Kavita servers such as Suwayomi and is caught by `pcall`, so streaming always starts at page 1.
 - **No HTTP connection reuse.** Each page opens a new TCP connection. The comment in `socketutil.lua` warns that connection reuse via a custom `create` function is error-prone under HTTPS, so it was left alone.
+
+### Changelog
+
+**0.0.2**
+
+- **Fixed a crash that took KOReader down.** The `__index` metamethod's first parameter was named `_`, shadowing the gettext function in the same file, so any page that failed to load reached `_("...")` and died with `attempt to call local '_' (a table value)`. Upstream has the same trap at `opdspse.lua:106`, but only on the rare invalid-protocol branch; adding a failure notice here turned it into a common path.
+- **Much smoother page turns.** Prefetch timeouts went from 4s/10s to 6s/15s. The shorter ones were killing merely-slow pages, which were then retried 2.5 s later — fetching them twice. On device, the slowest single fetch fell from 3–4 s to **785 ms**, an order of magnitude less variance.
+- **The memory cache is capped in bytes** (16 MB) rather than pages, so a server with large pages keeps fewer of them instead of quietly eating memory.
+- **Eviction is by distance from the current page**, not insertion order — the latter dropped exactly the pages the reader was about to need whenever memory ran short.
+- Look-ahead widened from 2 to 3 pages, look-behind from 1 to 2.
+- The prefetch chain no longer re-waits 0.35 s between steps (`PREFETCH_CHAIN_DELAY`), so the window fills sooner.
+- **The disk cache is now off by default.** Writing a page to the SD card is synchronous and sits on the page-turn path, and device logs showed a zero hit rate.
+- Added a guard that stops the prefetch chain when the window does not fit in the memory cache, rather than refetching the same pages forever.
+- The release archive now contains an `opdsforcomic.koplugin` folder, so it is unzip-and-drop with **no renaming**.
+
+**0.0.1**
+
+- Initial test release.
 
 ### License
 
