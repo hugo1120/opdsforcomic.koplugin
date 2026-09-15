@@ -108,6 +108,26 @@ http://你的服务器:4567/api/opds/v1.2
 
 也可以绑到手势上：设置 → 手势 → 文件管理器 → 搜索 `OPDS Catalog (Comic)`。
 
+#### 阅读界面的按钮
+
+点击屏幕中间三分之一唤出底部按钮栏：
+
+| 按钮 | 作用 |
+|---|---|
+| `Scale` / `Original size` | 适屏与原尺寸之间切换 |
+| `Rotate` / `No rotation` | 旋转 90° |
+| `Go to` | 打开页码输入框，**已预填当前页**；标题显示「第 N 页，共 M 页」 |
+| `Crop` | 自动裁剪白边的开关，开启后按钮带 ✓ |
+| `Close` | 关闭 |
+
+**自动裁剪默认关闭。** 开启后每页会用一个 96×96 的采样网格估算内容边界，把四周空白切掉；判定不确信时**原样返回，不裁**。思路取自 TinyPic / Kindle Comic Converter：先从四角检测背景色、二值化、再取内容包围盒，并在多处设置保守的退出条件。
+
+其中**四角检测背景色**是必要的：漫画有黑底页，假设白底会把画面当成空白裁掉、反而留下黑边。
+
+裁剪只在内存里改变显示范围，不改动缓存的原始字节，也不影响预取。开启后日志每页会记一行 `crop 2480x3508 -> 120,180..2360,3320`，`nothing to trim` 表示判定不确信、保持了原样。
+
+> 未实现 TinyPic 的页码裁剪。它必须把页码和「底部居中的小分格」区分开，判错就是静默删掉画面，代价太高。
+
 ### 缓存与可调参数
 
 | | 位置 | 上限 | 生命周期 |
@@ -138,7 +158,17 @@ local DISK_CACHE_MAX_BYTES = 64 * 1024 * 1024
 local DISK_CACHE_MAX_AGE = 30 * 24 * 60 * 60  -- 秒
 
 local MAX_DECODE_SCALE = 0        -- 0 = 关闭，见下
+
+-- 自动裁剪（Crop 按钮）
+local AUTOCROP_SAMPLES = 96       -- 采样网格密度（每轴）
+local AUTOCROP_POWER = 0.6        -- 0~3，越大裁得越激进
+local AUTOCROP_EDGE_BAND = 2      -- 边缘多少格算边框
+local AUTOCROP_EDGE_NOISE_MAX = 0.02
+local AUTOCROP_MIN_GAIN = 0.02    -- 省得比这还少就不裁
+local AUTOCROP_MAX_TRIM = 0.35    -- 单边最多裁掉这个比例
 ```
+
+`AUTOCROP_POWER` 映射到二值化阈值 `240 - power*64`，沿用 TinyPic 的公式但**默认取 0.6 而非 1.0**——裁进网点比留条白边糟得多。
 
 **为什么向前是 3、向后是 2：** 顺序阅读时每次翻页恒定只需要新抓 1 页——窗口里其余都在缓存里。所以 `PREFETCH_AHEAD` 设 2 还是 3，**稳态网络负载完全一样**，差别只是缓冲深度：网络抖动时你有多大余量不被追上。向后则是跳着回看的保险。
 
@@ -182,6 +212,13 @@ opdsforcomic: page 45: ready in 2310 ms via net
 - **未实现 HTTP 连接复用。** 目前每页新建一次 TCP 连接。`socketutil.lua` 的注释指出，用自定义 `create` 函数处理 HTTPS 连接复用很容易出问题，因此没有贸然改动。
 
 ### 更新日志
+
+**0.0.3**
+
+- 新增 **Go to** 按钮：页码输入框**预填当前页**，标题显示「第 N 页，共 M 页」。
+- 新增 **Crop** 自动裁剪白边开关（默认关闭）。思路取自 TinyPic / Kindle Comic Converter：先从四角检测背景色（**漫画有黑底页，假设白底会把画面裁掉、留下黑边**）、二值化、取内容包围盒，并在多处设置保守的退出条件。用 96×96 采样网格代替逐像素扫描——全分辨率扫描图的像素量 Lua 走不动。
+- 新按钮标签自带中英两种文字。KOReader 的 gettext 只读安装根目录的 `l10n/<lang>/koreader.mo`，**插件无法注册自己的翻译目录**（核心代码与所有内置插件都没有 l10n）。
+- 未实现页码裁剪：收益小，而判错就是**静默删掉画面**。
 
 **0.0.2**
 
@@ -310,6 +347,26 @@ The full `/api/opds/v1.2` path is required; `/api/opds` and `/opds` both return 
 
 You can also bind it to a gesture: Settings → Gestures → File manager → search for `OPDS Catalog (Comic)`.
 
+#### Reading-view buttons
+
+Tap the middle third of the screen to bring up the bottom button bar:
+
+| Button | What it does |
+|---|---|
+| `Scale` / `Original size` | Toggle between fit-to-screen and native size |
+| `Rotate` / `No rotation` | Rotate by 90° |
+| `Go to` | Opens a page-number dialog, **pre-filled with the current page**, titled "Page N of M" |
+| `Crop` | Toggles automatic margin trimming; shows a ✓ when on |
+| `Close` | Close the viewer |
+
+**Auto crop is off by default.** When on, each page gets a 96×96 sample grid to estimate where the content ends, and the blank margins are trimmed away. When the estimate is not convincing the page is left **exactly as it was**.
+
+The approach is taken from TinyPic / Kindle Comic Converter: detect the background colour from the corners, binarise, take the bounding box of what remains, and bail out at several points if the result looks wrong. The **corner check matters**: manga has black pages, and assuming white would classify the artwork as blank and keep the margins instead.
+
+Cropping only changes what region is displayed in memory. It does not touch the cached bytes and does not affect prefetching. With it on, the log gains a line per page — `crop 2480x3508 -> 120,180..2360,3320`, or `nothing to trim` when the estimate was not convincing.
+
+> TinyPic's page-number pass is not implemented. Telling a page number apart from a small panel at the bottom centre is exactly the kind of guess that silently deletes artwork.
+
 ### Caching and Tuning
 
 | | Location | Cap | Lifetime |
@@ -340,7 +397,17 @@ local DISK_CACHE_MAX_BYTES = 64 * 1024 * 1024
 local DISK_CACHE_MAX_AGE = 30 * 24 * 60 * 60  -- seconds
 
 local MAX_DECODE_SCALE = 0        -- 0 disables it; see below
+
+-- auto crop (the Crop button)
+local AUTOCROP_SAMPLES = 96       -- sample grid density, per axis
+local AUTOCROP_POWER = 0.6        -- 0..3, higher trims more aggressively
+local AUTOCROP_EDGE_BAND = 2      -- grid lines at each edge treated as border
+local AUTOCROP_EDGE_NOISE_MAX = 0.02
+local AUTOCROP_MIN_GAIN = 0.02    -- do not bother for less than this
+local AUTOCROP_MAX_TRIM = 0.35    -- never cut more than this off one side
 ```
+
+`AUTOCROP_POWER` maps to a binarisation threshold of `240 - power*64`, TinyPic's formula, but defaulted to **0.6 rather than their 1.0**: cropping into a screentone is far worse than leaving a margin behind.
 
 **Why 3 ahead and 2 behind.** Reading forwards consumes one prefetched page per turn and fetches exactly one new one, so in steady state `PREFETCH_AHEAD = 2` and `3` cost the same bandwidth — the difference is only how much slack there is before the reader outruns the link. Depth behind is insurance for jumping backwards past what is still cached.
 
@@ -382,6 +449,13 @@ The `via` field tells you whether caching is working: `mem` and `disk` are hits,
 - **No HTTP connection reuse.** Each page opens a new TCP connection. The comment in `socketutil.lua` warns that connection reuse via a custom `create` function is error-prone under HTTPS, so it was left alone.
 
 ### Changelog
+
+**0.0.3**
+
+- Added a **Go to** button: the page-number dialog is **pre-filled with the current page** and titled "Page N of M".
+- Added a **Crop** toggle for trimming blank margins (off by default). The approach is from TinyPic / Kindle Comic Converter: detect the background colour from the corners — **manga has black pages, and assuming white crops the artwork and keeps the margins** — binarise, take the bounding box, and bail out conservatively at several points. Sampling is a 96×96 grid rather than a per-pixel scan, because Lua cannot walk a full-resolution scan on this hardware.
+- The new button labels carry their own Chinese and English text: KOReader's gettext only reads `l10n/<lang>/koreader.mo` from the install root, and **a plugin cannot register a catalogue of its own** (neither the core nor any bundled plugin does).
+- TinyPic's page-number pass is not implemented: small payoff, and getting it wrong **silently deletes artwork**.
 
 **0.0.2**
 

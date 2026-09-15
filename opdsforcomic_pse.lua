@@ -94,6 +94,40 @@ local DISK_CACHE_MAX_AGE = 30 * 24 * 60 * 60
 --- pressure rather than network or decode being the bottleneck.
 local MAX_DECODE_SCALE = 0
 
+--- Auto page crop, trimming blank margins. Off by default: it costs a grid of
+--- pixel reads per page and it can only ever guess.
+---
+--- The approach follows TinyPic / Kindle Comic Converter, which detect the
+--- background colour from the corners, binarise, and take the bounding box of
+--- what is left, with several chances to bail out and leave the page alone.
+--- The one deliberate difference is sampling: those tools scan every pixel
+--- through PIL, which is far too slow in Lua on this class of device. Page
+--- margins are large relative to the page, so a coarse grid resolves them.
+---
+--- TinyPic also offers a page-number pass. It is not implemented here: it has
+--- to tell a page number from a small panel sitting at the bottom centre, and
+--- getting that wrong silently deletes artwork.
+local AUTOCROP_KEY = "opdsforcomic_autocrop"
+local AUTOCROP_SAMPLES = 96        -- grid points per axis
+--- 0..3, mapped to a binarisation threshold of 240 - power*64, as TinyPic
+--- does. Kept well below TinyPic's default of 1.0: cropping into a light
+--- screentone is far worse than leaving a margin behind.
+local AUTOCROP_POWER = 0.6
+local AUTOCROP_EDGE_BAND = 2       -- outermost grid lines treated as border
+local AUTOCROP_EDGE_NOISE_MAX = 0.02
+local AUTOCROP_MIN_GAIN = 0.02     -- ignore trims smaller than this fraction
+local AUTOCROP_MAX_TRIM = 0.35     -- never cut more than this off one side
+
+--- The plugin cannot ship a translation catalogue of its own: KOReader's
+--- gettext only ever reads l10n/<lang>/koreader.mo from the install root
+--- (see gettext.lua), and no bundled plugin carries one. So the few labels
+--- added here bring their own two languages.
+local function L(en, zh)
+    local lang = _.current_lang
+    if lang and lang:sub(1, 2) == "zh" then return zh end
+    return en
+end
+
 local LOG_PREFIX = "opdsforcomic: "
 local function log(fmt, ...)
     if select("#", ...) > 0 then
@@ -224,12 +258,181 @@ end
 
 --- Renders image bytes, downscaling first if the image is much larger than
 --- the screen. Returns nil if the bytes could not be decoded at all.
-local function renderBounded(data, index)
+--- Reads the page on a coarse grid and reports which samples look like ink.
+---
+--- Everything downstream works off this grid rather than the pixels: a
+--- full-resolution scan is tens of millions of pixels and Lua is in no
+--- position to walk them on this hardware.
+local function samplePage(bb)
+    local w, h = bb:getWidth(), bb:getHeight()
+    if w < 16 or h < 16 then return nil end
+
+    local cols = math.min(AUTOCROP_SAMPLES, w)
+    local rows = math.min(AUTOCROP_SAMPLES, h)
+
+    local lum = {}
+    for r = 1, rows do
+        local y = math.floor((r - 0.5) * h / rows)
+        local row = {}
+        for c = 1, cols do
+            local x = math.floor((c - 0.5) * w / cols)
+            local px = bb:getPixel(x, y)
+            -- getColor8() reduces every buffer type to a 0..255 grey.
+            row[c] = px and px:getColor8().a or 255
+        end
+        lum[r] = row
+    end
+
+    -- Background from the four corners. Manga has black pages as well as
+    -- white ones, and assuming white on a black page would invert the whole
+    -- decision — cropping the artwork away and keeping the margins.
+    local corners = (lum[1][1] + lum[1][cols] + lum[rows][1] + lum[rows][cols]) / 4
+    local invert = corners <= 128
+
+    local threshold = 240 - AUTOCROP_POWER * 64
+    local content, col_hits, row_hits = {}, {}, {}
+    for c = 1, cols do col_hits[c] = 0 end
+    for r = 1, rows do
+        row_hits[r] = 0
+        content[r] = {}
+        for c = 1, cols do
+            local v = lum[r][c]
+            if invert then v = 255 - v end
+            if v <= threshold then
+                content[r][c] = true
+                col_hits[c] = col_hits[c] + 1
+                row_hits[r] = row_hits[r] + 1
+            else
+                content[r][c] = false
+            end
+        end
+    end
+
+    return {
+        w = w, h = h, cols = cols, rows = rows,
+        content = content, col_hits = col_hits, row_hits = row_hits,
+    }
+end
+
+--- Clears content from the outermost grid lines when they hold only a trace
+--- of it. A speck or two of scanner noise on the very edge would otherwise
+--- pin the bounding box to the page border and defeat the crop entirely.
+--- TinyPic's ignore_pixels_near_edge, run on the sampled grid.
+local function clearEdgeNoise(a)
+    local function clearLine(is_row, idx)
+        local total = is_row and a.cols or a.rows
+        local hits = is_row and a.row_hits[idx] or a.col_hits[idx]
+        if hits == 0 or hits / total >= AUTOCROP_EDGE_NOISE_MAX then return end
+        for i = 1, total do
+            local r = is_row and idx or i
+            local c = is_row and i or idx
+            if a.content[r][c] then
+                a.content[r][c] = false
+                a.row_hits[r] = a.row_hits[r] - 1
+                a.col_hits[c] = a.col_hits[c] - 1
+            end
+        end
+    end
+    for k = 1, AUTOCROP_EDGE_BAND do
+        clearLine(true, k)
+        clearLine(true, a.rows - k + 1)
+        clearLine(false, k)
+        clearLine(false, a.cols - k + 1)
+    end
+end
+
+--- Grid cells back to page pixels, padded by one cell. A cell is about the
+--- resolution of the measurement, so that slack is what keeps the crop from
+--- shaving a sliver off the artwork.
+local function gridBBox(a)
+    local top, bottom, left, right
+    for r = 1, a.rows do
+        if a.row_hits[r] > 0 then
+            top = top or r
+            bottom = r
+        end
+    end
+    for c = 1, a.cols do
+        if a.col_hits[c] > 0 then
+            left = left or c
+            right = c
+        end
+    end
+    if not top or not left then return nil end
+
+    local pad_x = math.ceil(a.w / a.cols)
+    local pad_y = math.ceil(a.h / a.rows)
+    local x0 = math.max(0, math.floor((left - 1) * a.w / a.cols) - pad_x)
+    local y0 = math.max(0, math.floor((top - 1) * a.h / a.rows) - pad_y)
+    local x1 = math.min(a.w, math.floor(right * a.w / a.cols) + pad_x)
+    local y1 = math.min(a.h, math.floor(bottom * a.h / a.rows) + pad_y)
+    return x0, y0, x1, y1
+end
+
+--- Returns a crop box, or nil to leave the page alone.
+local function measureCrop(bb)
+    local a = samplePage(bb)
+    if not a then return nil end
+    clearEdgeNoise(a)
+
+    local x0, y0, x1, y1 = gridBBox(a)
+    if not x0 then return nil end
+
+    -- Bail out unless the crop both gains something and stays sane. This is
+    -- guesswork on a sampled grid: doing nothing is always an acceptable
+    -- answer, cropping into the artwork is not.
+    local w, h = a.w, a.h
+    if x0 > w * AUTOCROP_MAX_TRIM or (w - x1) > w * AUTOCROP_MAX_TRIM then return nil end
+    if y0 > h * AUTOCROP_MAX_TRIM or (h - y1) > h * AUTOCROP_MAX_TRIM then return nil end
+    local gain_x = (x0 + (w - x1)) / w
+    local gain_y = (y0 + (h - y1)) / h
+    if gain_x < AUTOCROP_MIN_GAIN and gain_y < AUTOCROP_MIN_GAIN then return nil end
+    if x1 - x0 < w * 0.2 or y1 - y0 < h * 0.2 then return nil end
+
+    return { x0, y0, x1, y1 }
+end
+
+local function cropTo(bb, box)
+    local w, h = box[3] - box[1], box[4] - box[2]
+    if w <= 0 or h <= 0 then return nil end
+    local Blitbuffer = require("ffi/blitbuffer")
+    local out = Blitbuffer.new(w, h, bb:getType())
+    if not out then return nil end
+    out:blitFrom(bb, 0, 0, box[1], box[2], w, h)
+    return out
+end
+
+local function renderBounded(data, index, crop_cache)
     local bb = RenderImage:renderImageData(data, #data, false)
     if not bb then
         log("page %d: decode failed (%d bytes)", index, #data)
         return nil
     end
+
+    if G_reader_settings:isTrue(AUTOCROP_KEY) and crop_cache then
+        -- Measured once per page and remembered; false means "measured, and
+        -- there was nothing worth cutting".
+        local box = crop_cache[index]
+        if box == nil then
+            box = measureCrop(bb) or false
+            crop_cache[index] = box
+            if box then
+                log("page %d: crop %dx%d -> %d,%d..%d,%d",
+                    index, bb:getWidth(), bb:getHeight(),
+                    box[1], box[2], box[3], box[4])
+            else
+                log("page %d: nothing to trim", index)
+            end
+        end
+        if box then
+            local cropped = cropTo(bb, box)
+            if cropped then
+                bb:free()
+                bb = cropped
+            end
+        end
+    end
+
     if MAX_DECODE_SCALE <= 0 then
         return bb
     end
@@ -356,6 +559,8 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
 
     local cache = {}
     local cache_bytes = 0
+    -- page index -> crop box, or false once measured with nothing to trim
+    local crop_cache = {}
     local closed = false
     local retried = {}
     local last_failure_notice = 0
@@ -505,7 +710,7 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
             end
             return RenderImage:renderImageFile("resources/koreader.png", false)
         end
-        local bb = renderBounded(data, index)
+        local bb = renderBounded(data, index, crop_cache)
         if not bb then
             cacheDrop(index)
             return RenderImage:renderImageFile("resources/koreader.png", false)
@@ -614,8 +819,82 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
         closed = true
         UIManager:unschedule(prefetchNext)
         cache, cache_bytes = {}, 0
+        crop_cache = {}
         return orig_on_close_widget(this, ...)
     end
+
+    -- The stock bar offers scale / rotate / close. Add a page jump and an
+    -- auto-crop toggle.
+    --
+    -- The "scale" and "rotate" ids have to survive: ImageViewer:update() looks
+    -- them up by id and calls setText() on the result, so dropping either
+    -- would crash on the very next repaint.
+    local ButtonTable = require("ui/widget/buttontable")
+    local CenterContainer = require("ui/widget/container/centercontainer")
+    local Geom = require("ui/geometry")
+
+    viewer.button_table = ButtonTable:new{
+        width = viewer.width - 2 * viewer.button_padding,
+        buttons = {
+            {
+                {
+                    -- id "scale" is required by ImageViewer:update()
+                    id = "scale",
+                    text = viewer._scale_to_fit and _("Original size") or _("Scale"),
+                    callback = function()
+                        viewer.scale_factor = viewer._scale_to_fit and 1 or 0
+                        viewer._scale_to_fit = not viewer._scale_to_fit
+                        viewer._center_x_ratio = 0.5
+                        viewer._center_y_ratio = 0.5
+                        viewer:update()
+                    end,
+                },
+                {
+                    -- id "rotate" is required by ImageViewer:update()
+                    id = "rotate",
+                    text = viewer.rotated and _("No rotation") or _("Rotate"),
+                    callback = function()
+                        viewer.rotated = not viewer.rotated and true or false
+                        viewer:update()
+                    end,
+                },
+                {
+                    id = "goto",
+                    text = L("Go to", "跳转"),
+                    callback = function() OPDSPSE:jumpToPage(viewer, count) end,
+                },
+                {
+                    id = "crop",
+                    text = L("Crop", "裁剪"),
+                    -- Button appends a checkmark when this is true, evaluated
+                    -- at paint time, so no manual label refresh is needed.
+                    checked_func = function()
+                        return G_reader_settings:isTrue(AUTOCROP_KEY)
+                    end,
+                    callback = function()
+                        G_reader_settings:flipNilOrFalse(AUTOCROP_KEY)
+                        crop_cache = {} -- the setting changed, so measure again
+                        reloadCurrentPage()
+                        viewer:update()
+                    end,
+                },
+                {
+                    id = "close",
+                    text = _("Close"),
+                    callback = function() viewer:onClose() end,
+                },
+            },
+        },
+        zero_sep = true,
+        show_parent = viewer,
+    }
+    viewer.button_container = CenterContainer:new{
+        dimen = Geom:new{
+            w = viewer.width,
+            h = viewer.button_table:getSize().h,
+        },
+        viewer.button_table,
+    }
 
     UIManager:show(viewer)
     if continue then
@@ -638,9 +917,13 @@ end
 
 -- Shows a page number dialog for page streaming.
 function OPDSPSE:jumpToPage(viewer, count)
+    -- Pre-filled with where the reader already is, so this both answers "what
+    -- page am I on" and lets that be adjusted.
+    local current = viewer and viewer._images_list_cur or 1
     local input_dialog
     input_dialog = InputDialog:new{
-        title = _("Enter page number"),
+        title = T(L("Page %1 of %2", "第 %1 页，共 %2 页"), current, count),
+        input = tostring(current),
         input_type = "number",
         input_hint = "(" .. "1 - " .. count .. ")",
         buttons = {
