@@ -31,7 +31,7 @@ Fork 自 KOReader 内置的 `opds.koplugin`，独立安装、独立配置，与�
 
 - 菜单：`文件管理器 → 顶部扳手 → 搜索 → OPDS catalog (Comic)`
 - 手势：`设置 → 手势 → 文件管理器` 搜 `OPDS Catalog (Comic)`
-- **文件夹快捷方式**：把 `OPDS for Comic.opdscomic` 放在任意文件夹，**点它就直接进入 OPDS 界面**，不用每次走菜单。文件内容留空即可，扩展名就是全部机制。（菜单里的「Create an OPDS shortcut here」会在当前文件夹生成一个。）
+- **文件夹快捷方式**：在任意文件夹里放一个**空文件**，文件名随意、扩展名用 `.opdscomic`（例如 `OPDS for Comic.opdscomic`），**点它就直接进入 OPDS 界面**，不用每次走菜单。扩展名就是全部机制，文件内容不会被读取，改名也不会失效——名字只是你自己认它的标记。（没有做「生成快捷方式」的按钮：这件事每台设备只做一次，不值得在任何菜单里占一行。）
 
 添加服务器时填 OPDS 地址，以 Suwayomi-Server 为例：`http://你的服务器:4567/api/opds/v1.2`。路径必须带全 `/api/opds/v1.2`；认证通常留空。
 
@@ -84,7 +84,7 @@ A fork of KOReader's bundled `opds.koplugin`, installed and configured separatel
 
 - Menu: `File manager → wrench icon → Search → OPDS catalog (Comic)`
 - Gesture: `Settings → Gestures → File manager`, search for `OPDS Catalog (Comic)`
-- **Folder shortcut**: drop `OPDS for Comic.opdscomic` into any folder and **tapping it goes straight to the OPDS interface**, with no menu. The file can be empty — the extension is the whole mechanism. (`Create an OPDS shortcut here` in the menu makes one in the folder being browsed.)
+- **Folder shortcut**: put an **empty file** with a `.opdscomic` extension into any folder — the name is yours to choose (e.g. `OPDS for Comic.opdscomic`) — and **tapping it goes straight to the OPDS interface**, with no menu. The extension is the whole mechanism, the contents are never read, and renaming it does not break it: the name is just how you recognise it. (There is no "make a shortcut" button anywhere; this is done once per device and is not worth a row in a menu.)
 
 For a server, enter its OPDS address; with Suwayomi-Server that is `http://your-server:4567/api/opds/v1.2`. The full `/api/opds/v1.2` is required; authentication can usually be left empty.
 
