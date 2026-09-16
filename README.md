@@ -137,14 +137,36 @@ http://你的服务器:4567/api/opds/v1.2
 |---|---|
 | `Rotate 90°` / 旋转 90° | 同点按；旋转后自动关闭面板 |
 | `Two pages` / 双页显示 | 左右两页并排显示 |
-| `Right to left` / 从右到左 | 双页时第 1 页排在右边（日式漫画的读法，默认开） |
+| `Split two-page scans` / 拆开双页扫描 | 把一张图里的两页切开，一屏只显示一页 |
+| `Right to left` / 从右到左 | 双页时第 1 页排在右边；拆页时先读右边那半（日式漫画的读法，默认开） |
 | `First page is cover` / 首页单独显示 | 第 1 页单独一屏，之后按 (2,3) (4,5)… 配对 |
+
+**共三种显示模式：单页 / 双页（拼页）/ 拆页（切半）。** 三者互斥，面板里开一个会自动关掉另一个——双页配拆页会把四页塞进一屏。互斥只在 `dualPageOn()` 一处判定，所以配对、页数、预取深度这些调用方都不必知道拆页存在。
 
 **旋转与双页是绑在一起的**：转到横屏自动打开双页，转回竖屏自动恢复单页——横屏只看一页漫画没有意义。面板里的「双页显示」仍可手动开启，手动开的值会**跨章节保留**；由旋转带出来的则不会，下次打开章节回到单页。
 
-后两项在双页关闭时置灰，打开双页后立刻可用。**「从右到左」默认开启**，因为这是漫画插件；左开本的书要在这里关掉。
+**「从右到左」在双页或拆页任一开启时可用，「首页单独显示」只在双页下可用**（拆页不需要它：跨页图是要量出来的，封面只占一页就原样显示）。**「从右到左」默认开启**，因为这是漫画插件；左开本的书要在这里关掉。
 
 双页是**显示时合成**的：一次解码两个源页、拼成一张宽图再交给 `ImageViewer`，缓存与预取仍然按源页工作，完全不知道双页的存在。配对规则与 KOReader 内置的漫画插件（`comicreader.koplugin`）一致。
+
+##### 拆页：把跨页扫描拆成单页
+
+有些资源把跨页存成**一张横图**。直接看是一页要缩着脖子读的图，开双页又会变成四页一屏。打开「拆开双页扫描」后，每张图在**解码之后、裁剪之前**量一次宽高比：
+
+- `w/h` 落在 **1.15 ~ 2.1** 之间 → 认定这张是两页，**按几何中点切半**，一屏显示一半。
+- 低于 1.15 → 竖图，原样整页显示；高于 2.1 → 太宽了，更像一条长条（跨页大格、或扫描本身的毛病），切开会切进画面，也原样显示。
+
+**判据只有宽高比**，是因为解码头之后、画面出来之前，这是唯一能知道的东西，也是唯一与扫描分辨率无关的性质：漫画单页是竖的，两张并排是横的。取 1.15 而不是 1.0，是因为裁过边的扫描可能只是「略宽于高」，而真正的跨页在 1.4 附近。
+
+切分取几何中点，**不做脊线检测**：扫描的装订线可能是一道黑带、一条细线或一道折痕，每一种都既像内容又像噪声，去找它总会有落在分格里的风险。中点的误差从来不大，剩下的那点装订线交给自动裁剪。
+
+> **已知短板：扫描时就转了 90° 的单页也是横的，会被切开。** 本地没有任何信息能把它和跨页区分开，解法只能是把这个开关关掉。
+
+开拆页后**编号分两层**：*源页* 是服务器章节里的第几张图，*显示槽位* 是读者按一次翻页键走过的一屏。一张跨页占两个槽位，所以 `Go to` 和进度仍按源页号走——读者不必自己换算。一页占 1 还是 2 个槽位要解码后才知道，所以是**边读边学**：未解码的页按 2 个槽位算（这是读者对整章的断言，不是猜测），解码后当场纠正。判定只写在该源页的**第一个**槽位上，而它只累加这个源页**之前**的页，所以学到答案不会让映射自己漂移，屏幕上的页也不会跳。整章都是单页时会自然收敛成 1 槽/页，首页封面不需要任何设置。
+
+**旋转是拆页的临时开关**：转到横屏显示整张跨页原图（横屏本来就是要看跨页的姿势），转回竖屏恢复切半。它不写任何持久设置。
+
+半页是**切出来就留着**的：渲染第一半时顺手把另一半也切好缓存起来（只多一次 `blitFrom`），下一屏直接用，省掉一次整张重解码——实测半页的 948 ms 里有 685 ms 就是解码那张 12.6 Mpx 的跨页。日志里这半页显示为 `via stash`，往回翻也照样命中。只存「读者旁边那一张」，因为一张半页的缓冲区约 15 MB。
 
 **关闭只能靠按钮。** 原版的单指滑动关闭已禁用——在「适应屏幕」缩放下，一次漂移几毫米的点按和短促滑动在电子墨水屏上无法区分，误触会直接退出整章且屏幕上没有任何提示。多指滑动、Back 键（有实体键的机型）和 `Close` 按钮仍然可用。
 
@@ -188,6 +210,11 @@ local AUTOCROP_EDGE_BAND = 2      -- 边缘多少格算边框
 local AUTOCROP_EDGE_NOISE_MAX = 0.02
 local AUTOCROP_MIN_GAIN = 0.02    -- 省得比这还少就不裁
 local AUTOCROP_MAX_TRIM = 0.35    -- 单边最多裁掉这个比例
+
+-- 离章补记阅读进度（见更新日志 0.0.6）
+local PROGRESS_REPORT_DELAY = 1   -- 关闭阅读界面后延迟多久再发（秒）
+local PROGRESS_BLOCK_TIMEOUT = 4  -- 单次读取超时（秒）
+local PROGRESS_TOTAL_TIMEOUT = 8  -- 总超时（秒），比翻页的紧：没人等这个答案
 ```
 
 `AUTOCROP_POWER` 映射到二值化阈值 `240 - power*64`，沿用 TinyPic 的公式但**默认取 0.6 而非 1.0**——裁进网点比留条白边糟得多。
@@ -210,6 +237,14 @@ local AUTOCROP_MAX_TRIM = 0.35    -- 单边最多裁掉这个比例
 
 **也别指望让服务器发小图。** Suwayomi 的页面端点只接受 `updateProgress` / `format` / `opds` 三个参数，图片按存储分辨率原样输出、没有任何缩放路径（`Page.getPageImageServe` 走 `ImageIO`）。所以大页超采样 3~4 倍是**没有服务端解法**的，代码里那行 `{maxWidth}` 替换只对少数别的目录有效。
 
+#### 关于离章补记进度
+
+opds-pse 协议里**没有独立的记账端点**：服务端唯一的按页记账钩子就是「带着 `updateProgress=true` 取一张图」。而缓存命中率实测 90%，也就是说**一百次翻页只有九次真的发请求**，服务端记下的位置其实是"最后一次缓存未命中"，通常远落后于你关章时的位置。
+
+所以关掉阅读界面时会**补记一次**：只发一个请求，页号改成你离开的那一页。四条闸门：目录模板里本来就有 `updateProgress=true`（不把 `false` 改写成 `true`，那是目录方的明确意愿）、你确实比开章时读得更靠后、链路是通的、以及**每章只发一次**（发过就不再重试）。按实测页均 0.83 MB 算，约每章多 1% 流量。
+
+**它仍然跑在 UI 线程上**（LuaSocket 没有异步），延后 1 秒只是让文件浏览器先画出来、把可能的卡顿放到画面稳定之后，并不是消除卡顿。所以超时取 4s/8s，比翻页的 6s/15s 紧得多——没人等这个答案，超时就放弃。
+
 ### 日志
 
 插件输出带 `opdsforcomic:` 前缀。**默认级别是 `info`，调试日志不输出**，需要手动打开：
@@ -227,21 +262,37 @@ opdsforcomic: page 42: prefetch fetched 946605 bytes in 412 ms
 opdsforcomic: page 43: ready in 187 ms via mem
 opdsforcomic: page 44: ready in 530 ms via disk
 opdsforcomic: page 45: ready in 2310 ms via net
+opdsforcomic: page 46: ready in 34 ms via stash as 1800x2790 (half 2 of sheet 23)
+opdsforcomic: page 4: two pages on the sheet, splitting
+opdsforcomic: progress: reported page 87 in 412 ms
 opdsforcomic: prefetch: updateProgress forced to false, page turns stay authoritative
 ```
 
-`via` 后面的来源直接说明缓存有没有生效：`mem` / `disk` 是命中，`net` 是预取没赶上、只能现取。`net` 占比高说明网络仍是瓶颈。
+`via` 后面的来源直接说明缓存有没有生效：`mem` / `disk` / `stash` 是命中，`net` 是预取没赶上、只能现取。`net` 占比高说明网络仍是瓶颈。`via stash` 指拆页模式下这一半是上一屏顺手切好留下的（见上）。
 
-最后一行每章出现一次，出现在预取请求里的 `updateProgress` 参数被改写时（见更新日志 0.0.5）。
+`two pages on the sheet, splitting` / `one page on the sheet` 是拆页模式的判定结果，逐页出现；括号里的 `(half N of sheet M)` 说明这是源页 M 的第 N 半。
+
+`prefetch:` 那行每章出现一次，出现在预取请求里的 `updateProgress` 参数被改写时（见更新日志 0.0.5）。`progress:` 那行同样每章最多一次，是关章时的补记（见上）；`NOT reported` 表示发了但失败了，`not reporting` 是位置没前移、按设计跳过。
 
 ### 已知限制
 
 - **预取是阻塞式的。** KOReader 没有线程池，预取在主线程执行，超时为 6s/15s，最坏情况卡顿上限 15 秒。打开对话框时预取会主动让路（见上），但翻页路径本身仍然是同步的。彻底的解法是用 `socket.select` 做分片非阻塞下载，尚未实现。
 - **不继承上游更新。** 这是完整 fork，KOReader 对 `opds.koplugin` 的修复不会自动流入，升级后需手动重新合并。
 - **保留的原版行为**：Kavita 专用进度查询（`getLastPage`）对 Suwayomi 等非 Kavita 服务器会直接抛错并被 `pcall` 兜底为 0，因此始终从第 1 页开始。
+- **拆页模式下最贵的是第一次打开一张跨页。** 要整张解码才能知道它是不是跨页、才能切半（12.6 Mpx 实测 948 ms）；另一半由缓存接下（`via stash`，约 34 ms）。整章都是单页时没有这笔开销。
 - **未实现 HTTP 连接复用。** 目前每页新建一次 TCP 连接。`socketutil.lua` 的注释指出，用自定义 `create` 函数处理 HTTPS 连接复用很容易出问题，因此没有贸然改动。
 
 ### 更新日志
+
+**0.0.6**
+
+- 新增**拆页显示模式**（长按 `Rotate` 的面板里「拆开双页扫描」）。有些资源把跨页存成一张横图：直接看太小，开双页又变四页一屏。打开后每张图在解码头、裁剪前量一次宽高比，落在 1.15~2.1 之间就按两页处理，**按几何中点切半**，`从右到左` 决定先读哪半。判据只看宽高比 ⇒ 与扫描分辨率无关。**已知短板：扫描时就转了 90° 的单页也是横的，会被切开**，本地没有信息能区分它和跨页。
+- **三种显示模式互斥**：单页 / 双页（拼页）/ 拆页（切半）。互斥只在 `dualPageOn()` 一处判定，配对、页数、预取深度都不必知道拆页存在；面板里开一个会自动关掉另一个。预取窗口在拆页时**减半**（一张跨页要两屏才能看完，所以同样的屏数只需要一半的页深）。
+- **编号分两层：源页 vs 显示槽位。** 一张跨页占两个槽位，`Go to` 与页码仍按**源页**（服务器章节里的第几张图），读者不用自己换算。一页占几槽要解码后才知道，于是**边读边学**：未解码的按 2 槽算，学到答案只写在该源页的第一个槽位 ⇒ 映射不自我漂移、屏幕上的页不跳；整章单页时自然收敛成 1 槽/页，封面不需要设置。
+- **旋转是拆页的临时开关**：转到横屏显示整张跨页原图，转回竖屏恢复切半，不写任何持久设置。
+- **跨页的另一半会缓存下来**（日志里的 `via stash`）。渲染这一半时顺手把另一半也切好留着，下一屏直接用——实测半页 948 ms 里 685 ms 是解码那张 12.6 Mpx 的跨页，这次切分只多一次 `blitFrom`。只留「读者旁边那一张」，一张半页缓冲区约 15 MB。
+- **半页与整页的裁剪框分开存**，否则整页量出来的框会套到半页上。
+- **离章补记一次阅读进度。** 服务端只认「带着 `updateProgress=true` 取一张图」，而缓存命中率 90% ⇒ 真实请求很少，进度会停在原地。现在关闭阅读界面时补发一次，页号改成离开时那一页（每章约 +1% 流量）。位置没前移、目录没要求、链路不通都不发；每章最多一次，失败不重试。
 
 **0.0.5**
 
@@ -419,14 +470,36 @@ Cropping only changes what region is displayed in memory. It does not touch the 
 |---|---|
 | `Rotate 90°` | Same as a tap; closes the panel afterwards |
 | `Two pages` | Show two pages side by side |
-| `Right to left` | Puts the first page on the right in two-page mode (the manga convention, on by default) |
+| `Split two-page scans` | Cut the two pages held in one landscape sheet apart, one to a screen |
+| `Right to left` | Puts the first page on the right in two-page mode, and reads the right half first when splitting (the manga convention, on by default) |
 | `First page is cover` | Page 1 gets a screen to itself; later spreads are (2,3) (4,5)… |
+
+**There are three display modes — single page, two pages (stitching), split (cutting).** They are exclusive, and turning one on from the panel turns the other off; two-page plus split would put four pages on one screen. The exclusivity is decided in the single place `dualPageOn()` looks at, so the pairing, the page counts and the prefetch depth never have to know the split exists.
 
 **Rotation and dual-page are tied together**: going landscape turns two-page mode on, returning to portrait turns it off — a single page sideways is pointless. The panel's `Two pages` row still works by hand, and a by-hand choice **carries over between chapters**; a rotation-made one does not, so the next chapter opens single-page.
 
-The last two rows are greyed out while two-page mode is off and become usable the moment it is on. **`Right to left` is on by default** because this is a manga plugin; turn it off for left-bound books.
+**`Right to left` is live whenever two-page or split is on; `First page is cover` only under two-page** (the split does not need it: a cover holding one page is simply measured and left whole). **`Right to left` is on by default** because this is a manga plugin; turn it off for left-bound books.
 
 Two-page mode is **composited at display time**: two source pages are decoded and stitched into one wide buffer before the viewer sees it, so the cache and the prefetcher keep working in source pages and never learn that two of them are on screen. The pairing rules come from KOReader's bundled comic plugin, `comicreader.koplugin`.
+
+##### Splitting: cutting two-page scans back into single pages
+
+Some releases store a spread as **one landscape image**. Read as it comes it is a page you squint at, and pairing it with its neighbour under two-page mode puts four pages on screen. Switch on `Split two-page scans` and each sheet is measured once, **after decoding and before cropping**:
+
+- `w/h` between **1.15 and 2.1** → the sheet is taken to hold two pages and is **cut at the geometric middle**, one half to a screen.
+- Below 1.15 → portrait, shown whole. Above 2.1 → far too wide, more like a strip (a panorama panel, or the scanner's own mess); halving that would slice artwork, so it is shown whole too.
+
+**The verdict rests on the aspect ratio alone** because, between decoding the header and having a picture, that is the only thing known — and the one property that holds at any scan resolution: a manga page is portrait, two of them side by side are landscape. It is 1.15 rather than 1.0 because a scan trimmed to its artwork can come out barely wider than tall, while a genuine pair sits nearer 1.4.
+
+The cut is the geometric middle, with **no gutter detection**: a scan's binding can be a black band, a hairline rule or a crease, and every one of those reads as content or as noise depending on the paper, so a search for it would sometimes land inside a panel. The middle is never wrong by much, and the auto crop trims what is left of the gutter.
+
+> **Known gap: a single page stored rotated a quarter turn is landscape and will be cut in half.** Nothing local tells that apart from a spread, so the cure is to switch the setting off.
+
+With the split on, **numbering gains a second layer**: the *source page* is the nth image in the server's chapter, the *display slot* is one screen of one press of the page key. A spread occupies two slots, so `Go to` and the page counter still work in source pages and the reader never has to convert. Whether a page holds one slot or two is only knowable after decoding, so it is **learned as it is read**: an undecoded page is taken to hold two (the setting is an assertion the reader makes about the chapter, not a guess) and corrected on the spot. The verdict is only ever written on that source page's *first* slot, which counts only the pages before it — so learning the answer cannot make the mapping drift under the reader, and the page on screen does not jump. A chapter of single pages converges to one slot each by itself, and the cover page needs no setting.
+
+**Rotation is the split's temporary switch**: going landscape shows the whole spread uncut (sideways is the pose for looking at a spread anyway) and returning to portrait splits it again. It writes no persistent setting.
+
+Halves are **cut and kept**: rendering one half also cuts the other and caches it (one extra `blitFrom`), so the next screen uses it directly and skips a full re-decode — of the 948 ms a half costs on device, 685 ms is decoding that 12.6 Mpx sheet. The log calls this `via stash`, and turning back hits it too. Only the half next to the reader is kept, since one half is about a 15 MB buffer.
 
 **Closing is the button's job.** The stock one-finger swipe-to-close is disabled: at "scaled for best fit" a tap that drifts a few millimetres is indistinguishable from a short flick on e-ink, and a misread silently drops the whole chapter with nothing on screen to explain it. A multiswipe, the Back key (on devices that have one) and `Close` all still work.
 
@@ -470,6 +543,11 @@ local AUTOCROP_EDGE_BAND = 2      -- grid lines at each edge treated as border
 local AUTOCROP_EDGE_NOISE_MAX = 0.02
 local AUTOCROP_MIN_GAIN = 0.02    -- do not bother for less than this
 local AUTOCROP_MAX_TRIM = 0.35    -- never cut more than this off one side
+
+-- the close-time progress report (see the 0.0.6 changelog entry)
+local PROGRESS_REPORT_DELAY = 1   -- seconds to wait after the viewer closes
+local PROGRESS_BLOCK_TIMEOUT = 4  -- per-read timeout, in seconds
+local PROGRESS_TOTAL_TIMEOUT = 8  -- total timeout, in seconds; tighter than a page turn's
 ```
 
 `AUTOCROP_POWER` maps to a binarisation threshold of `240 - power*64`, TinyPic's formula, but defaulted to **0.6 rather than their 1.0**: cropping into a screentone is far worse than leaving a margin behind.
@@ -490,6 +568,14 @@ Off by default, because it usually costs more than it saves. `ImageViewer` start
 
 **Nor is there a way to ask the server for a smaller image.** Suwayomi's page endpoint takes only `updateProgress`, `format` and `opds`, and serves the image at its stored resolution with no resizing anywhere (`Page.getPageImageServe` goes through `ImageIO`). The 3–4x oversampling of large pages therefore has **no server-side fix**; the `{maxWidth}` substitution in the code only helps against the few catalogs that offer a width placeholder.
 
+#### About the close-time progress report
+
+The opds-pse protocol has **no endpoint that only records progress**: the server's one per-page hook is "fetch an image with `updateProgress=true`". And the measured cache hit rate is 90%, so **only nine page turns in a hundred actually make a request** — what the server has recorded is really "the last cache miss", usually far behind the page you closed the chapter on.
+
+So closing the viewer **reports once**: one request, with the page number rewritten to the one you left on. Four gates: the catalog's template already carries `updateProgress=true` (a `false` is never rewritten to `true` — that is the catalog's own explicit choice), you really did get further than where the chapter opened, the link is up, and **it happens once per chapter** (having tried, it does not retry). At the ~0.83 MB pages measured, that is about 1% extra traffic per chapter.
+
+**It still runs on the UI thread** (LuaSocket has no async); the one-second delay only lets the file browser paint first, so a hitch lands after the screen has settled rather than removing it. Hence the 4 s / 8 s timeouts, much tighter than a page turn's 6 s / 15 s — nobody is waiting for the answer, so overshooting it is simply given up on.
+
 ### Logging
 
 Plugin output is prefixed with `opdsforcomic:`. **The default level is `info`, so debug output is suppressed** until you enable it:
@@ -507,21 +593,37 @@ opdsforcomic: page 42: prefetch fetched 946605 bytes in 412 ms
 opdsforcomic: page 43: ready in 187 ms via mem
 opdsforcomic: page 44: ready in 530 ms via disk
 opdsforcomic: page 45: ready in 2310 ms via net
+opdsforcomic: page 46: ready in 34 ms via stash as 1800x2790 (half 2 of sheet 23)
+opdsforcomic: page 4: two pages on the sheet, splitting
+opdsforcomic: progress: reported page 87 in 412 ms
 opdsforcomic: prefetch: updateProgress forced to false, page turns stay authoritative
 ```
 
-The `via` field tells you whether caching is working: `mem` and `disk` are hits, `net` means the prefetch did not get there in time. A high proportion of `net` means the network is still the bottleneck.
+The `via` field tells you whether caching is working: `mem`, `disk` and `stash` are hits, `net` means the prefetch did not get there in time. A high proportion of `net` means the network is still the bottleneck. `via stash` marks a half the previous screen cut and kept (see above).
 
-The last line appears once per chapter, when the `updateProgress` parameter of a prefetch request has been rewritten (see the 0.0.5 changelog entry).
+`two pages on the sheet, splitting` / `one page on the sheet` are the split mode's verdicts, one per page; the `(half N of sheet M)` suffix says this is half N of source page M.
+
+The `prefetch:` line appears once per chapter, when the `updateProgress` parameter of a prefetch request has been rewritten (see the 0.0.5 changelog entry). `progress:` appears at most once per chapter too, and is the close-time report (see above); `NOT reported` means it was sent and failed, `not reporting` means the reader had not moved forward and it was skipped by design.
 
 ### Known Limitations
 
 - **Prefetching is blocking.** KOReader has no thread pool, so prefetches run on the main thread. Timeouts are 6 s / 15 s, bounding the worst-case stall at fifteen seconds. A prefetch now stands aside while a dialog is open (see above), but the page-turn path itself is still synchronous. The thorough fix is chunked non-blocking downloads with `socket.select`, not implemented.
 - **Upstream fixes do not flow in.** This is a full fork; KOReader's fixes to `opds.koplugin` will not arrive automatically and must be merged by hand.
 - **Inherited behaviour**: the Kavita-specific progress lookup (`getLastPage`) throws on non-Kavita servers such as Suwayomi and is caught by `pcall`, so streaming always starts at page 1.
+- **Under the split, the expensive screen is the first look at a spread.** The whole sheet has to be decoded before it can be measured and halved (948 ms measured on 12.6 Mpx); the other half is then served from the cache (`via stash`, about 34 ms). A chapter of single pages pays none of this.
 - **No HTTP connection reuse.** Each page opens a new TCP connection. The comment in `socketutil.lua` warns that connection reuse via a custom `create` function is error-prone under HTTPS, so it was left alone.
 
 ### Changelog
+
+**0.0.6**
+
+- Added a **split display mode** (`Split two-page scans` in the panel on a long press of `Rotate`). Some releases store a spread as one landscape image: read as it comes it is too small, and two-page mode would put four pages on screen. Switch it on and each sheet is measured once after decoding and before cropping — `w/h` between 1.15 and 2.1 means two pages, so the sheet is **cut at the geometric middle** and `Right to left` decides which half is read first. The verdict rests on the aspect ratio alone, so it holds at any scan resolution. **Known gap: a single page stored rotated a quarter turn is landscape and will be cut in half** — nothing local can tell it from a spread.
+- **Three display modes are now exclusive**: single page, two pages (stitching), split (cutting). The exclusivity is decided in the one place `dualPageOn()` looks at, so the pairing, the page counts and the prefetch depth never have to know the split exists; turning one on from the panel turns the other off. The prefetch window is **halved** under the split, since one spread takes two screens to read.
+- **Numbering gained a second layer: source page versus display slot.** A spread occupies two slots, while `Go to` and the page counter stay in **source pages** (the nth image in the server's chapter), so the reader never converts anything. How many slots a page holds is only knowable after decoding, so it is **learned as it is read**: undecoded pages count as two, and the verdict is written only on that source page's first slot — so the mapping cannot drift and the page on screen does not jump. A chapter of single pages converges to one slot each, and the cover needs no setting.
+- **Rotation is the split's temporary switch**: landscape shows the whole spread uncut, portrait splits it again, and no persistent setting is written.
+- **The other half of a spread is kept** (`via stash` in the log). Rendering one half also cuts the other and holds it for the next screen — of the 948 ms a half costs, 685 ms is decoding that 12.6 Mpx sheet, and this adds one `blitFrom`. Only the half next to the reader is kept; one half is about a 15 MB buffer.
+- **Halves and whole pages keep their crop boxes apart**, so a box measured on the whole page cannot be applied to a half of it.
+- **One progress report at chapter close.** The server's only per-page hook is "fetch an image with `updateProgress=true`", and a 90% cache hit rate means very few real requests — so recorded progress sat still. Closing the viewer now sends one request with the page number rewritten to the page left on (about 1% extra traffic per chapter). It is skipped when the reader has not moved forward, when the catalog does not ask for it, and when the link is down; once per chapter, and no retry after a failure.
 
 **0.0.5**
 
