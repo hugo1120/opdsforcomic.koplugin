@@ -2,7 +2,9 @@ local BD = require("ui/bidi")
 local ConfirmBox = require("ui/widget/confirmbox")
 local DataStorage = require("datastorage")
 local Dispatcher = require("dispatcher")
+local DocumentRegistry = require("document/documentregistry")
 local LuaSettings = require("luasettings")
+local Notification = require("ui/widget/notification")
 local OPDSBrowser = require("opdsforcomic_browser")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
@@ -47,9 +49,95 @@ local OPDS = WidgetContainer:extend{
     },
 }
 
+--- The extension that turns a file into a door into this plugin.
+---
+--- Chosen to be one nothing else claims: registering a provider for it is what
+--- tells the file browser the file can be opened at all, so borrowing a
+--- supported extension would hijack whatever owns it.
+local SHORTCUT_EXT = "opdscomic"
+local SHORTCUT_BASENAME = "OPDS for Comic"
+
+-- Registration is a process-wide, once-only thing but init() runs twice --
+-- KOReader builds one instance of every plugin for the file manager and
+-- another for the reader. A second addProvider() would only leave a duplicate
+-- in the registry's array, which getProviders() collapses anyway, but one entry
+-- is what was meant.
+local shortcut_provider_registered = false
+
 function OPDS:init()
     self:onDispatcherRegisterActions()
+    self:registerShortcutProvider()
     self.ui.menu:registerToMainMenu(self)
+end
+
+--- Makes `<anything>.opdscomic` a file that opens this plugin.
+---
+--- KOReader has a mechanism for this and it involves neither a document nor the
+--- reader. `FileManager:openFile` inspects the provider's `order` field, and
+--- when it is set the provider counts as *auxiliary*: instead of building a
+--- ReaderUI it simply calls `file_manager[provider.provider]:openFile(file)`.
+--- That method is below, and `provider = self.name` is the join -- the file
+--- manager registers this instance under the plugin's own name, so
+--- "opdsforcomic" resolves back to us. The same trick is what makes
+--- archiveviewer.koplugin and texteditor.koplugin open their own file types.
+---
+--- addProvider is the half that makes the file *visible*: the browser hides
+--- files whose extension no provider claims, unless the reader turns on "Show
+--- unsupported files", and registering the extension is what marks it known.
+--- addAuxProvider is the half that makes it findable by key, which is the path
+--- the "Open with" dialog and the per-file association take.
+function OPDS:registerShortcutProvider()
+    if shortcut_provider_registered then return end
+    shortcut_provider_registered = true
+    local provider = {
+        provider_name = _("OPDS catalog (Comic)"),
+        provider = self.name,
+        -- The presence of `order` is the whole signal that this is auxiliary;
+        -- its value only orders the "Open with" list.
+        order = 30,
+        disable_file = true,
+        disable_type = false,
+    }
+    DocumentRegistry:addAuxProvider(provider)
+    DocumentRegistry:addProvider(SHORTCUT_EXT, "application/x-opds-comic", provider, 100)
+end
+
+--- Where a tap on a shortcut ends up, instead of on a document.
+---
+--- `file` goes unused: every shortcut opens the same catalog browser, and the
+--- file's name is the reader's own label for it. Reading the file's contents to
+--- pick a server -- one shortcut per catalog -- is the obvious next step and is
+--- deliberately not taken until somebody wants it.
+function OPDS:openFile(file)
+    self:onShowOPDSForComicCatalog()
+end
+
+--- Puts a shortcut in the folder the reader is browsing.
+---
+--- Empty on purpose: the extension is the entire mechanism, and a file with no
+--- contents cannot be mistaken for a document by anything else. An existing
+--- file is left alone, since it may have been renamed on purpose.
+function OPDS:createShortcut()
+    local dir = self.ui.file_chooser and self.ui.file_chooser.path
+    if not dir then return end
+    local filename = SHORTCUT_BASENAME .. "." .. SHORTCUT_EXT
+    local path = dir .. "/" .. filename
+    local existing = io.open(path, "r")
+    local notice
+    if existing then
+        existing:close()
+        notice = T(_("%1 is already here"), BD.filename(filename))
+    else
+        local created = io.open(path, "w")
+        if not created then
+            Notification:notify(_("Could not create the shortcut."))
+            return
+        end
+        created:close()
+        notice = T(_("Created %1 -- tap it to open the catalog"), BD.filename(filename))
+    end
+    self.ui.file_chooser:refreshPath()
+    Notification:notify(notice)
 end
 
 function OPDS:loadSettings()
@@ -77,6 +165,15 @@ function OPDS:addToMainMenu(menu_items)
             sorting_hint = "search",
             callback = function()
                 self:onShowOPDSForComicCatalog()
+            end,
+        }
+        -- Next to the entry above on purpose: one opens the catalog now, the
+        -- other leaves a file behind that opens it later without the menu.
+        menu_items.opdsforcomic_shortcut = {
+            text = _("Create an OPDS shortcut here"),
+            sorting_hint = "search",
+            callback = function()
+                self:createShortcut()
             end,
         }
     end
