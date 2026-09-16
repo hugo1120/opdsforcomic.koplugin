@@ -166,7 +166,9 @@ http://你的服务器:4567/api/opds/v1.2
 
 **旋转是拆页的临时开关**：转到横屏显示整张跨页原图（横屏本来就是要看跨页的姿势），转回竖屏恢复切半。它不写任何持久设置。
 
-半页是**切出来就留着**的：渲染第一半时顺手把另一半也切好缓存起来（只多一次 `blitFrom`），下一屏直接用，省掉一次整张重解码——实测半页的 948 ms 里有 685 ms 就是解码那张 12.6 Mpx 的跨页。日志里这半页显示为 `via stash`，往回翻也照样命中。只存「读者旁边那一张」，因为一张半页的缓冲区约 15 MB。
+半页是**切出来就留着**的：渲染第一半时顺手把两半都切好缓存起来，下一屏直接用，省掉一次整张重解码——实测重解码一次半页约 1.3 s，而从缓存取只要约 0.14 s。日志里显示为 `via stash`。往回翻到一张跨页的前半页、或者改了设置（旋转、拆页、双页、方向）再回到同一屏，同样命中；后者是 0.0.7 才做到的，此前正在显示的那一半从不留在缓存里。
+
+缓存同时留**三张**半页，最近用到的优先保留，放不下的先淘汰。三这个数是推出来的：站在任一半页上，前、后两屏加上当前这半页，正好三张。每张是全分辨率的 24 位缓冲区，本机约 15 MB，所以三张约 47 MB 常驻——这是它在 512 MB 设备上的代价，要收紧只需调小 `STASH_DEPTH`，逻辑不变。
 
 **关闭只能靠按钮。** 原版的单指滑动关闭已禁用——在「适应屏幕」缩放下，一次漂移几毫米的点按和短促滑动在电子墨水屏上无法区分，误触会直接退出整章且屏幕上没有任何提示。多指滑动、Back 键（有实体键的机型）和 `Close` 按钮仍然可用。
 
@@ -279,10 +281,20 @@ opdsforcomic: prefetch: updateProgress forced to false, page turns stay authorit
 - **预取是阻塞式的。** KOReader 没有线程池，预取在主线程执行，超时为 6s/15s，最坏情况卡顿上限 15 秒。打开对话框时预取会主动让路（见上），但翻页路径本身仍然是同步的。彻底的解法是用 `socket.select` 做分片非阻塞下载，尚未实现。
 - **不继承上游更新。** 这是完整 fork，KOReader 对 `opds.koplugin` 的修复不会自动流入，升级后需手动重新合并。
 - **保留的原版行为**：Kavita 专用进度查询（`getLastPage`）对 Suwayomi 等非 Kavita 服务器会直接抛错并被 `pcall` 兜底为 0，因此始终从第 1 页开始。
-- **拆页模式下最贵的是第一次打开一张跨页。** 要整张解码才能知道它是不是跨页、才能切半（12.6 Mpx 实测 948 ms）；另一半由缓存接下（`via stash`，约 34 ms）。整章都是单页时没有这笔开销。
+- **拆页模式下最贵的是第一次打开一张跨页。** 要整张解码才能知道它是不是跨页、才能切半（12.6 Mpx 实测约 0.6 s 解码，加约 0.55 s 切半与裁剪）。第二半、往回翻、以及设置来回切都由缓存接下（`via stash`，约 0.14 s）。整章都是单页时没有这笔开销。
+- **整页（横屏看跨页，或关掉拆页）没有任何缓存。** 凡是把当前屏整个重算的操作——改设置、转屏——都要重新解码整张（实测约 0.88 s 一次）。半页那套缓存在这里用不上：整页就是解码出来的那张本身，旁边没有「另一半」可以顺手留下。这是目前已知最大的一块可优化项，尚未处理。
 - **未实现 HTTP 连接复用。** 目前每页新建一次 TCP 连接。`socketutil.lua` 的注释指出，用自定义 `create` 函数处理 HTTPS 连接复用很容易出问题，因此没有贸然改动。
 
 ### 更新日志
+
+**0.0.7**
+
+这一版只做一件事：**已经看过的一屏，不该再解码一次。** 没有新功能，显示出来的东西不变。
+
+- **半页缓存从「只留一张」改成三张，并且把正在显示的那一半也留下。** 此前只留「读者旁边那一张」，于是往回翻到一张跨页的**前半页**、或者改了设置（旋转、拆页开关、双页、阅读方向）再回到同一屏，都要整张重新解码——实测同一张半页因此被重解码 5 次，一次 11 分钟的会话里这类重复解码合计 10.1 s。现在前后两个方向、以及设置来回切，都能从缓存取（实测约 0.14 s，对比重解码约 1.3 s）。代价是常驻内存从约 15 MB 升到约 47 MB，要收紧调小 `STASH_DEPTH` 即可。
+- **拆页渲染把「切半」和「裁剪」合并成一次拷贝**（裁过的框已知时）。以前先把一半切出来、再按裁剪框裁一次，同样的像素搬两遍；合并后只搬一遍，实测省下约 0.26 s。首次渲染仍要两遍——裁剪框是在切出来的那一半上量出来的，必须先有东西可量——但结果会存下来，之后就是一遍。日志行末标 `(fused clip)` 表示走了这条路。
+- **修掉「从右到左」切换后修剪用错框的问题。** 半页的裁剪框按「第几半」编号缓存，而切换阅读方向会改变这个编号指的是左半还是右半，于是切过去之后会拿另一半量出来的框去裁。现在切方向时一并清掉半页的裁剪框缓存（整页的不清——整张图不随方向移动）。这个 bug 一直存在，只是要恰好在中途切方向才会看到。
+- **日志更便于定位卡顿。** 渲染那行从三段计时（`decode` / `cut` / `crop`）扩到四段，多一个 `keep`（为缓存复制半页的耗时，实测约 0.12 s）。另新增 `reload:` 行，记下每次「把当前屏整个重算」是谁要求的（改裁剪、拆页、双页、方向、旋转），此前这些改动全是静默的——上面那 10.1 s 就是因为没有这行而无法归因。
 
 **0.0.6**
 
@@ -499,7 +511,9 @@ With the split on, **numbering gains a second layer**: the *source page* is the 
 
 **Rotation is the split's temporary switch**: going landscape shows the whole spread uncut (sideways is the pose for looking at a spread anyway) and returning to portrait splits it again. It writes no persistent setting.
 
-Halves are **cut and kept**: rendering one half also cuts the other and caches it (one extra `blitFrom`), so the next screen uses it directly and skips a full re-decode — of the 948 ms a half costs on device, 685 ms is decoding that 12.6 Mpx sheet. The log calls this `via stash`, and turning back hits it too. Only the half next to the reader is kept, since one half is about a 15 MB buffer.
+Halves are **cut and kept**: rendering one half also cuts and caches both, so the next screen uses it directly and skips a full re-decode — a re-decode of one half measures about 1.3 s on device against about 0.14 s out of the cache. The log calls this `via stash`. Turning back onto the *front* half of a sheet, or changing a setting (rotation, split, two-page, direction) and returning to the same screen, hits it too; the second of those only works from 0.0.7, which is when the half being displayed started being kept as well.
+
+**Three** halves are held at once, least recently used out. Three is derived rather than tuned: standing on any half, the screens in front of and behind it plus the one being displayed are exactly three. Each is a full-resolution 24-bit buffer, about 15 MB on this panel, so three is about 47 MB resident — that is the price on a 512 MB device, and tightening it is a matter of lowering `STASH_DEPTH`, with no other change.
 
 **Closing is the button's job.** The stock one-finger swipe-to-close is disabled: at "scaled for best fit" a tap that drifts a few millimetres is indistinguishable from a short flick on e-ink, and a misread silently drops the whole chapter with nothing on screen to explain it. A multiswipe, the Back key (on devices that have one) and `Close` all still work.
 
@@ -610,10 +624,20 @@ The `prefetch:` line appears once per chapter, when the `updateProgress` paramet
 - **Prefetching is blocking.** KOReader has no thread pool, so prefetches run on the main thread. Timeouts are 6 s / 15 s, bounding the worst-case stall at fifteen seconds. A prefetch now stands aside while a dialog is open (see above), but the page-turn path itself is still synchronous. The thorough fix is chunked non-blocking downloads with `socket.select`, not implemented.
 - **Upstream fixes do not flow in.** This is a full fork; KOReader's fixes to `opds.koplugin` will not arrive automatically and must be merged by hand.
 - **Inherited behaviour**: the Kavita-specific progress lookup (`getLastPage`) throws on non-Kavita servers such as Suwayomi and is caught by `pcall`, so streaming always starts at page 1.
-- **Under the split, the expensive screen is the first look at a spread.** The whole sheet has to be decoded before it can be measured and halved (948 ms measured on 12.6 Mpx); the other half is then served from the cache (`via stash`, about 34 ms). A chapter of single pages pays none of this.
+- **Under the split, the expensive screen is the first look at a spread.** The whole sheet has to be decoded before it can be measured and halved (about 0.6 s decoding plus 0.55 s cutting and cropping, measured on 12.6 Mpx). The other half, turns back, and settings toggled and back are all served from the cache (`via stash`, about 0.14 s). A chapter of single pages pays none of this.
+- **Whole pages (landscape spread viewing, or the split switched off) have no cache at all.** Anything that re-renders the current screen — changing a setting, rotating — decodes the whole sheet again (about 0.88 s each). The half-page cache cannot help here: a whole page *is* the decoded sheet, with no "other half" to keep alongside it. This is the largest known remaining cost and it is not addressed yet.
 - **No HTTP connection reuse.** Each page opens a new TCP connection. The comment in `socketutil.lua` warns that connection reuse via a custom `create` function is error-prone under HTTPS, so it was left alone.
 
 ### Changelog
+
+**0.0.7**
+
+Everything in this release is the one idea that **a screen already seen should not be decoded twice.** No new features, and nothing on screen changes.
+
+- **The half-page cache went from one entry to three, and the half being displayed is now kept as well.** It used to hold only "the half next to the reader", so turning back onto the **front** half of a sheet — or changing a setting (rotation, the split, two pages, reading direction) and returning to the same screen — decoded the whole sheet again. One half was observed being re-decoded five times that way, and an eleven-minute session spent 10.1 s on repeats of that kind. Both directions, and settings toggled and back, are now served from the cache (about 0.14 s, against about 1.3 s to re-decode). The cost is resident memory rising from about 15 MB to about 47 MB; tighten it by lowering `STASH_DEPTH`.
+- **Splitting now cuts and crops in a single copy** when the crop box is already known. It used to cut a half out and then trim it, moving the same pixels twice; the fused form moves them once, measured at about 0.26 s saved. The first render of a half still takes two passes — a crop box is measured on the half, so there has to be something to measure — but the answer is kept and every later render takes one. The log marks the fused form with `(fused clip)`.
+- **Fixed halving applying the wrong trim after switching reading direction.** A half's crop box is cached by which half it is, and flipping the direction changes which physical half that number refers to, so a box measured on one half was applied to the other. Switching direction now drops the half-page crop boxes (the whole-page ones are left alone, since a whole sheet does not move). The bug was always there; it took a direction change mid-chapter to show up.
+- **The log now says where a stall came from.** A render's timing line went from three segments (`decode` / `cut` / `crop`) to four, adding `keep` — the copy made so a half can be re-used, measured at about 0.12 s. And a new `reload:` line records what asked for the current screen to be re-rendered from scratch (crop, split, two pages, direction, rotation). Those were all silent before, which is exactly why the 10.1 s above could not be attributed to anything.
 
 **0.0.6**
 

@@ -78,6 +78,14 @@ local MEM_CACHE_MIN_PAGES = 4
 --- merely slow page gets killed and fetched twice.
 local PREFETCH_BLOCK_TIMEOUT = 6
 local PREFETCH_TOTAL_TIMEOUT = 15
+--- Consecutive prefetch failures before the look-ahead chain is left down for
+--- PREFETCH_COOLDOWN. Three rather than one: a single timeout usually means the
+--- network had a moment, and the attempt after it tends to succeed.
+local PREFETCH_FAIL_MAX = 3
+--- How long the chain stays down once that happens, in seconds. Long enough for
+--- a Wi-Fi reassociation to complete, short enough that the reader never has to
+--- do anything to get prefetching back.
+local PREFETCH_COOLDOWN = 45
 
 --- The close-time progress report. How long to wait after the viewer closes
 --- before sending it, and the timeouts for the request itself, in seconds.
@@ -113,6 +121,39 @@ local DISK_CACHE_MAX_AGE = 30 * 24 * 60 * 60
 --- make zooming in pointless. Worth revisiting only if the logs show memory
 --- pressure rather than network or decode being the bottleneck.
 local MAX_DECODE_SCALE = 0
+
+--- How many finished spread halves the stash keeps, least recently used first
+--- out.
+---
+--- Three, and the number is derived rather than tuned. The stash holds both
+--- halves of a sheet now (see renderSlot), so the question is which three. Read
+--- a spread left to right and the slots go h1 sN, h2 sN, h1 sN+1, h2 sN+1. A
+--- slot is only ever reached without a decode if it is already resident, and
+--- the slots that can be reached that way are the neighbours of where the
+--- reader is: sitting on h1 sN that is {h2 sN ahead, h2 sN-1 behind}, and
+--- sitting on h2 sN it is {h1 sN behind}. The largest set that covers every
+--- position at once is {h1 sN, h2 sN, h2 sN-1} -- three. Depth two loses the
+--- first member, which is why a back turn onto the *front* half of a sheet
+--- re-decoded; depth four buys nothing at all.
+---
+--- Measured on this panel: a stashed half costs ~140 ms to hand over against
+--- ~1180 ms to decode, cut and crop a fresh one, and a chapter's log showed
+--- seven of twenty-seven screens rendered more than once, all of them front
+--- halves -- 10.1 s of a 43-render session spent decoding pictures the reader
+--- had already seen.
+---
+--- The bill is memory, and it is the reason this is a constant rather than a
+--- hard-coded 3. Each entry is a full-resolution BBRGB24 half, 15-16 MB on this
+--- panel, so depth three holds ~47 MB. Counting the short-lived sheet (35.9 MB)
+--- and the two uncut halves (17.9 MB each) that exist at the same time, one
+--- spread render peaks near 141 MB of decoded buffers; KOReader itself sits
+--- somewhere between 30 MB and 140 MB depending on how long it has been reading
+--- manga. On a 512 MB device that is fine -- the project's own guidance is that
+--- 200-300 MB is still survivable -- but it is not free, MAX_DECODE_SCALE is
+--- the lever if it ever stops fitting, and the sanity check is the "High memory
+--- usage" alarm, which reads the process RSS out of /proc/self/statm and so
+--- does see these buffers.
+local STASH_DEPTH = 3
 
 --- Auto page crop, trimming blank margins. Off by default: it costs a grid of
 --- pixel reads per page and it can only ever guess.
@@ -538,7 +579,8 @@ local function cropTo(bb, box)
     return out
 end
 
---- Cuts half number `side` (1 or 2) out of a two-page sheet.
+--- Where half number `side` (1 or 2) sits on a two-page sheet, as a box in the
+--- sheet's own coordinates.
 ---
 --- Side 1 is the first page of the pair, and in a right-to-left manga that is
 --- the half on the right. The cut is the geometric middle: a scan's gutter can
@@ -546,17 +588,59 @@ end
 --- as content or as noise depending on the paper, so a search for it would
 --- sometimes land inside a panel. The middle is never wrong by much, and the
 --- auto crop trims what is left of the gutter when it is switched on.
-local function splitSheet(bb, side, rtl)
-    local w, h = bb:getWidth(), bb:getHeight()
-    local left_w = math.floor(w / 2)
-    if left_w < 1 or w - left_w < 1 then return nil end
+---
+--- Returned as a box rather than as a cut-out buffer because the box is what
+--- both callers actually want: one cuts the half as it came off the sheet, the
+--- other cuts it with its crop box already applied. Keeping the arithmetic in
+--- one place is what stops those two from drifting apart.
+local function halfRect(sheet_w, sheet_h, side, rtl)
+    local left_w = math.floor(sheet_w / 2)
+    if left_w < 1 or sheet_w - left_w < 1 then return nil end
     -- `side == 1` means "the first page of the pair"; rtl puts that page on the
     -- right, so the two only disagree when the reader asked for the other
     -- reading direction.
     if (side == 1) == rtl then
-        return cropTo(bb, { left_w, 0, w, h })
+        return { left_w, 0, sheet_w, sheet_h }
     end
-    return cropTo(bb, { 0, 0, left_w, h })
+    return { 0, 0, left_w, sheet_h }
+end
+
+--- Cuts half `rect` out of `sheet` in one pass, applying `box` -- a crop box
+--- measured on that half -- at the same time. `box` is a table, or false for a
+--- half that was measured and had nothing to trim; the caller only gets here
+--- once the box is known either way.
+---
+--- The offsets add because each box is stated in its own frame: `rect` is in
+--- the sheet's coordinates and `box` is in the half's, so the trim is just
+--- shifted by where the half sits.
+---
+--- One pass instead of two is the entire point. Cutting a half out and then
+--- trimming it moves the same pixels twice; on this panel the pair measured
+--- 293 ms (cut) + 259 ms (crop) of a 1180 ms half render, against ~250 ms for
+--- the fused form. It matters most on re-renders, which are what a chapter
+--- actually spends its time on: the first render of a half has to cut before
+--- there is anything to measure (see renderSlot).
+local function cutHalf(sheet, rect, box)
+    if box then
+        return cropTo(sheet, { rect[1] + box[1], rect[2] + box[2],
+                               rect[1] + box[3], rect[2] + box[4] })
+    end
+    return cropTo(sheet, rect)
+end
+
+--- A private copy of a BlitBuffer.
+---
+--- Needed wherever one buffer has to be kept while the caller carries on using
+--- -- and eventually frees -- the original. The page table is marked
+--- image_disposable, so the viewer frees whatever the page table hands it;
+--- anything the plugin wants to hold past that hand-over has to be a copy.
+local function copyBlitbuffer(bb)
+    local w, h = bb:getWidth(), bb:getHeight()
+    local Blitbuffer = require("ffi/blitbuffer")
+    local copy = Blitbuffer.new(w, h, bb:getType())
+    if not copy then return nil end
+    copy:blitFrom(bb, 0, 0, 0, 0, w, h)
+    return copy
 end
 
 --- Auto crops `bb`, measuring at most once per image. `key` names the image in
@@ -621,11 +705,22 @@ end
 --- whole sheet all over again -- by a wide margin the most expensive thing this
 --- plugin does. A 12.6 Mpx spread costs ~950 ms that way and ~35 ms this way.
 local function renderSlot(data, index, half, rotated, crop_cache, half_crop_cache, stash)
+    -- Where a slow page turn actually goes. Everything here but the decode is
+    -- this plugin's own work, and on a measured turn that was 551 ms of
+    -- 1180 ms -- nearly half, and the reason the work moved off the decoder.
+    -- Split into decode / cut / crop / keep so the next round aims at whichever
+    -- figure is big rather than at whichever looks big. Each figure is stated on
+    -- the measured form: cut and crop are separate only while a half's box is
+    -- unknown, and on the fused form the one clip is reported as cut with crop
+    -- at zero. The log says which form it was.
+    local started = now()
     local bb = RenderImage:renderImageData(data, #data, false)
     if not bb then
         log("page %d: decode failed (%d bytes)", index, #data)
         return nil, false
     end
+    local decode_ms = elapsedMs(started)
+    local cut_ms, crop_ms, keep_ms = 0, 0, 0
 
     -- Measured on the sheet, before anything is trimmed off it: the ratio is
     -- what the verdict rests on, and a crop would move it. Rotation turns the
@@ -637,40 +732,99 @@ local function renderSlot(data, index, half, rotated, crop_cache, half_crop_cach
     end
 
     if spread then
-        local mine = splitSheet(bb, half, rtlReading())
-        if mine then
+        local cut_started = now()
+        local rtl = rtlReading()
+        local mine_rect = halfRect(bb:getWidth(), bb:getHeight(), half, rtl)
+        if mine_rect then
             local other_half = half == 1 and 2 or 1
-            local other = splitSheet(bb, other_half, rtlReading())
-            bb:free()
-            bb = mine
-            if other then
+            local other_rect = halfRect(bb:getWidth(), bb:getHeight(), other_half, rtl)
+            local mine_key, other_key = index * 2 + half, index * 2 + other_half
+            local label = string.format("page %d half %d", index, half)
+            local other_label = string.format("page %d half %d", index, other_half)
+            local mine, other, fused
+
+            -- Two passes over each half, or four over the pair. A crop box is
+            -- measured on the half itself, so the first render of a half has to
+            -- cut it out before there is anything to measure -- four passes,
+            -- exactly as it always was. The answer is then kept in
+            -- half_crop_cache, and from that half's second render onwards the
+            -- box is known and the sheet can be clipped straight to the trimmed
+            -- half. A chapter spends most of its renders on repeats, so the
+            -- expensive form is now the rare one.
+            if half_crop_cache[mine_key] ~= nil and half_crop_cache[other_key] ~= nil then
+                mine = cutHalf(bb, mine_rect, half_crop_cache[mine_key])
+                other = other_rect and cutHalf(bb, other_rect, half_crop_cache[other_key]) or nil
+                fused = true
+                cut_ms = elapsedMs(cut_started)
+            else
+                mine = cropTo(bb, mine_rect)
+                other = other_rect and cropTo(bb, other_rect) or nil
+                cut_ms = elapsedMs(cut_started)
+                local crop_started = now()
                 -- Each half is measured on its own rather than inheriting the
                 -- sheet's box: it carries one outer margin and one gutter, and
                 -- both are the crop's business. Measured separately from this
                 -- half for the same reason, which is also why the two live in
                 -- half_crop_cache and not in crop_cache.
-                local other_label = string.format("page %d half %d", index, other_half)
-                other = autoCrop(other, index * 2 + other_half, half_crop_cache, other_label)
-                other = fitToDecodeBudget(other, other_label)
-                if stash then
-                    stash(index * 2 + other_half, other)
-                else
-                    other:free()
-                end
+                if mine then mine = autoCrop(mine, mine_key, half_crop_cache, label) end
+                if other then other = autoCrop(other, other_key, half_crop_cache, other_label) end
+                crop_ms = elapsedMs(crop_started)
             end
-            local label = string.format("page %d half %d", index, half)
-            bb = autoCrop(bb, index * 2 + half, half_crop_cache, label)
-            return fitToDecodeBudget(bb, label), true
+
+            if mine then
+                bb:free()
+                bb = mine
+                -- The cap sits outside the timed windows: it belongs to the
+                -- buffer either way, and at MAX_DECODE_SCALE 0 it is a no-op.
+                bb = fitToDecodeBudget(bb, label)
+                if other then
+                    other = fitToDecodeBudget(other, other_label)
+                    -- The eviction this may cause is logged by stashHalf itself,
+                    -- so a back turn that still decodes can be read from the log.
+                    if stash then
+                        stash(other_key, other)
+                    else
+                        other:free()
+                    end
+                end
+                -- Keep the half being handed over too. renderSlot is the only
+                -- place that ever holds both halves of a sheet, and without this
+                -- the half it returns can never be served from the stash -- which
+                -- is why a back turn onto the front half of a sheet, and every
+                -- settings change that re-renders the screen under the reader,
+                -- paid for the whole decode again. The copy is the price of it:
+                -- the viewer frees whatever the page table gives it.
+                if stash then
+                    local keep_started = now()
+                    local kept = copyBlitbuffer(bb)
+                    keep_ms = elapsedMs(keep_started)
+                    if kept then stash(mine_key, kept) end
+                end
+                log("%s: decode %d ms, cut %d ms, crop %d ms, keep %d ms%s", label,
+                    decode_ms, cut_ms, crop_ms, keep_ms, fused and " (fused clip)" or "")
+                return bb, true
+            elseif other then
+                -- The half asked for could not be cut but the other one could.
+                -- Nothing to show this turn, and nothing worth keeping it for.
+                other:free()
+            end
         end
         spread = false
     end
 
     -- skip_crop while rotated: turning the page sideways is usually about
     -- seeing the whole spread, so trimming it there works against the reader.
+    local label = string.format("page %d", index)
     if not rotated then
-        bb = autoCrop(bb, index, crop_cache, string.format("page %d", index))
+        local crop_started = now()
+        bb = autoCrop(bb, index, crop_cache, label)
+        crop_ms = elapsedMs(crop_started)
     end
-    return fitToDecodeBudget(bb, string.format("page %d", index)), false
+    bb = fitToDecodeBudget(bb, label)
+    log("%s: decode %d ms, cut %d ms, crop %d ms, keep %d ms%s", label,
+        decode_ms, cut_ms, crop_ms, keep_ms,
+        rotated and " (rotated, crop skipped)" or "")
+    return bb, false
 end
 
 -- This function attempts to pull chapter progress from Kavita.
@@ -696,7 +850,9 @@ function OPDSPSE:getLastPage(remote_url, username, password)
                 ["Accept-Encoding"] = "identity",
                 ["Authentication"] = api_key,
             },
-            sink        = ltn12.sink.table(auth_data),
+            -- Same reason as every other request in this file: only the custom
+            -- sink honours the total timeout (see socketutil.lua:39-51).
+            sink        = socketutil.table_sink(auth_data),
             user        = username,
             password    = password,
         })
@@ -724,7 +880,7 @@ function OPDSPSE:getLastPage(remote_url, username, password)
                     ["Accept-Encoding"] = "identity",
                     ["Authorization"] = "Bearer "..bearer_token,
                 },
-                sink        = ltn12.sink.table(progress_data),
+                sink        = socketutil.table_sink(progress_data),
                 user        = username,
                 password    = password,
             })
@@ -736,8 +892,15 @@ function OPDSPSE:getLastPage(remote_url, username, password)
         end
 
         if progress_code == 200 then
-            -- if HTTP GET was successful, pull page number from response
-            last_page = progress_data[1]:match("\"pageNum\":(.+),\"seriesId")
+            -- if HTTP GET was successful, pull page number from response.
+            -- tonumber, and a digits-only capture: the old .+ could run well
+            -- past the field, and a 200 whose body does not carry it at all
+            -- left last_page at nil -- which the caller then adds 1 to, an
+            -- arithmetic error that would take the whole chapter down over a
+            -- progress lookup that is only a convenience.
+            local body = progress_data[1]
+            local captured = body and body:match("\"pageNum\":(%-?%d+),\"seriesId")
+            last_page = tonumber(captured) or 0
         else
             logger.dbg("OPDSPSE:getLastPage: Progress Request failed:", progress_status or progress_code)
             logger.dbg("OPDSPSE:getLastPage: Progress Response headers:", progress_headers)
@@ -762,7 +925,11 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
         last_page = 0
     end
 
-    log("opening stream: %d pages", count)
+    -- Build tag. Temporary, and the only reason it exists: this plugin logs no
+    -- version of its own, so a device test cannot be told apart from testing
+    -- the previous build unless the log says which one ran. Remove together
+    -- with the "not a JPEG" diagnostic in renderSlot.
+    log("opening stream: %d pages [perf-fixes 2026-09-16c]", count)
 
     -- Raw image bytes, keyed by 0-based page index (ImageViewer page numbers
     -- are 1-based, so index == key - 1, as elsewhere in this file).
@@ -781,12 +948,17 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
     -- the sheet it came out of, and one key space shared between them would let
     -- a box measured on a whole page be applied to a half of one.
     local half_crop_cache = {}
-    -- The other half of the spread being read, already cut, trimmed and capped:
-    -- the screen one page turn away. Exactly one entry, because a decoded sheet
-    -- is the largest thing this plugin ever holds, and the half worth keeping is
-    -- always the one next to the reader. Hands back a private copy -- see
+    -- The other halves of the spreads being read, already cut, trimmed and
+    -- capped: the screens a page turn away. Least recently used first, never
+    -- more than STASH_DEPTH of them. A hit is served a private copy -- see
     -- takeStashedHalf.
-    local stashed_key, stashed_bb = nil, nil
+    --
+    -- The reading direction the half was cut in travels with it, per entry
+    -- rather than per stash: the cut depends on it, so the same key stands for
+    -- the opposite half once the setting is flipped, and a cut buffer cannot be
+    -- re-cut, only re-decoded. Keeping it beside the buffer is what lets an
+    -- entry survive a direction that changed and changed back.
+    local stash_entries = {}
     -- Source page -> how many display slots it holds, 1 or 2. Filled in as
     -- pages are decoded, because looking at one is the only way to know, and
     -- measuring the whole chapter up front would mean downloading it before
@@ -799,6 +971,16 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
     -- the chain forever — the next page turn re-arms it anyway.
     local prefetch_deferrals = 0
     local last_failure_notice = 0
+    -- Consecutive prefetch failures, and the time the chain may run again. The
+    -- chain already stops on the first failure, but every page turn re-arms it,
+    -- so a reader flipping through a chapter on a dead link launches a fresh
+    -- synchronous fetch on every turn -- each one owning the UI thread for as
+    -- long as the block timeout allows (19 s and 31.5 s were both measured in
+    -- one session). A short circuit break turns those into one: after
+    -- PREFETCH_FAIL_MAX in a row the chain stays down until the cooldown has
+    -- passed, and a page turn goes back to being a page turn.
+    local prefetch_fails = 0
+    local prefetch_gate_until = 0
     -- Whether the updateProgress rewrite in fetchPageData has been reported.
     -- Once per chapter, not once per fetch: the rewrite is a property of the
     -- catalog's template, so repeating it every prefetch would be noise.
@@ -810,35 +992,73 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
     local initial_source = nil
     local reported_progress = false
 
-    --- Keeps one half of a spread for the page turn after this one. The buffer
+    --- Lets the whole stash go. Called where every entry stops being valid at
+    --- once -- a change of auto-crop rebuilds every half differently -- and on
+    --- the way out, so it does not outlive the chapter. A change of reading
+    --- direction is handled per entry instead, in takeStashedHalf: it
+    --- invalidates the cut, not the buffers.
+    local function dropStash()
+        for i = 1, #stash_entries do stash_entries[i].bb:free() end
+        stash_entries = {}
+    end
+
+    --- Keeps one half of a spread for the page turns around this one. The buffer
     --- is owned here from now on: the caller hands it over and must not free it
     --- or touch it again.
     local function stashHalf(key, bb)
-        if stashed_bb then stashed_bb:free() end
-        stashed_key, stashed_bb = key, bb
+        -- A key can arrive twice only if a slot is rendered, turned away from
+        -- and rendered again inside one step. Then the buffer already held is
+        -- the same half, and the incoming one is the fresher: drop the old,
+        -- rather than carrying the same picture twice and evicting a different
+        -- half for the privilege.
+        for i = #stash_entries, 1, -1 do
+            local entry = stash_entries[i]
+            if entry.key == key then
+                entry.bb:free()
+                table.remove(stash_entries, i)
+            end
+        end
+        -- The direction the cut was made in is part of what is being kept.
+        -- halfRect puts side 1 on the right in a right-to-left book, so the same
+        -- key stands for the opposite half once the reader flips the setting --
+        -- and a cut buffer cannot be re-cut, only re-decoded.
+        table.insert(stash_entries, 1, { key = key, bb = bb, rtl = rtlReading() })
+        while #stash_entries > STASH_DEPTH do
+            local evicted = table.remove(stash_entries)
+            log("stash: evict key %d, %d kept", evicted.key, #stash_entries)
+            evicted.bb:free()
+        end
     end
 
     --- A private copy of the stashed half, or nil. The copy is not decoration:
     --- the viewer frees whatever the page table hands it (the page table is
-    --- marked image_disposable), so lending the stash out would free it out from
-    --- under the turn after this one -- and coming back would pay for the whole
-    --- decode again.
+    --- marked image_disposable), so lending a stashed buffer out would free it
+    --- out from under the turn after this one -- and coming back would pay for
+    --- the whole decode again.
     local function takeStashedHalf(key)
-        if not stashed_bb or stashed_key ~= key then return nil end
-        local w, h = stashed_bb:getWidth(), stashed_bb:getHeight()
-        local Blitbuffer = require("ffi/blitbuffer")
-        local copy = Blitbuffer.new(w, h, stashed_bb:getType())
-        if not copy then return nil end
-        copy:blitFrom(stashed_bb, 0, 0, 0, 0, w, h)
-        return copy
-    end
-
-    --- Lets the stash go. Called wherever the buffer stops being valid -- a
-    --- change of crop setting rebuilds every half differently -- and on the way
-    --- out, so it does not outlive the chapter.
-    local function dropStash()
-        if stashed_bb then stashed_bb:free() end
-        stashed_key, stashed_bb = nil, nil
+        for i = 1, #stash_entries do
+            local entry = stash_entries[i]
+            if entry.key == key then
+                -- Cut for the other reading direction, so it holds the wrong
+                -- half of the sheet: worth one re-decode to avoid handing the
+                -- reader that. Dropped rather than kept, so the next turn
+                -- re-cuts and re-stashes it the right way round instead of
+                -- finding this one again.
+                if entry.rtl ~= rtlReading() then
+                    entry.bb:free()
+                    table.remove(stash_entries, i)
+                    return nil
+                end
+                -- Asked for, so keep it: move it to the front, where the entry
+                -- the reader is actually bouncing between outlives the one a
+                -- single turn past put here. Only the ordering changes -- the
+                -- entry stays in the stash, and the caller gets a copy.
+                table.remove(stash_entries, i)
+                table.insert(stash_entries, 1, entry)
+                return copyBlitbuffer(entry.bb)
+            end
+        end
+        return nil
     end
 
     --- Whether the view is sideways right now. The viewer is still nil while
@@ -1031,7 +1251,14 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
             headers     = {
                 ["Accept-Encoding"] = "identity",
             },
-            sink        = ltn12.sink.table(page_data),
+            -- table_sink, not ltn12.sink.table, for the reason spelled out at
+            -- reportProgress below: a bare sink leaves the total timeout
+            -- unserved and keeps only the per-read block timeout, which
+            -- restarts on every chunk. This is the one request on the page-turn
+            -- path, so it is the one place where a server that dribbles an
+            -- image out holds the UI thread for as long as it likes -- measured
+            -- at 19 s and 31 s against a nominal limit of 15 s.
+            sink        = socketutil.table_sink(page_data),
             user        = username,
             password    = password,
         })
@@ -1318,6 +1545,46 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
     -- current from here on, and it only ever learns at a sheet's first slot.
     viewer._images_list_nb = slotCount()
 
+    -- Page turns repaint through ImageViewer's own wfm_mode, which is "ui" on
+    -- every panel that is not Kaleido (imageviewer.lua:377). On this device
+    -- waveform_ui and waveform_partial are the same waveform mode (AUTO, 257),
+    -- so the two differ in exactly one thing: UIManager promotes only
+    -- `mode == "partial"` to a flashing refresh (uimanager.lua:1163). "ui"
+    -- never flashes, so ghosting accumulates for as long as the chapter stays
+    -- open, and the reader's only way to clear it is a long press, which
+    -- nothing tells them about.
+    --
+    -- Answering "partial" instead costs nothing here and restores the ordinary
+    -- clear every FULL_REFRESH_COUNT turns. It is done by answering
+    -- hasKaleidoWfm affirmatively for the duration of one update() call, not by
+    -- copying ImageViewer:update into this file: wfm_mode is a local, so the
+    -- only thing an outside caller can influence is that predicate, and
+    -- narrowing the override to the call keeps it off everything else. (The
+    -- predicate's other readers are a CFA waveform boost in framebuffer_mxcfb
+    -- that is already guarded on Kaleido, and two widget colour checks -- none
+    -- of them runs inside update().)
+    --
+    -- Worth knowing: hasKaleidoWfm is a *function* on the device, not a flag.
+    -- generic/device.lua declares `local function yes() return true end` and
+    -- then writes `hasKaleidoWfm = no`, which is how a `Device:hasX()` call
+    -- manages to read what looks like a boolean field.
+    --
+    -- The reader keeps the last word: "avoid_flashing_ui" downgrades a regional
+    -- partial back to "ui" (uimanager.lua:1148), so anyone who would rather
+    -- keep the present never-flash behaviour gets it by switching that on under
+    -- E-ink settings.
+    local Device = require("device")
+    local orig_update = viewer.update
+    local orig_has_kaleido_wfm = Device.hasKaleidoWfm
+    viewer.update = function(this, ...)
+        Device.hasKaleidoWfm = function() return true end
+        -- Restore before re-raising: the override must not outlive the call
+        -- that needs it, whether that call succeeds or throws.
+        local ok, err = pcall(orig_update, this, ...)
+        Device.hasKaleidoWfm = orig_has_kaleido_wfm
+        if not ok then error(err, 0) end
+    end
+
     -- Swipe-to-close is off: closing is the Close button's job.
     --
     -- A one-finger flick while the page is scaled to fit closes the whole
@@ -1341,8 +1608,16 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
     local orig_on_swipe = viewer.onSwipe
     viewer.onSwipe = function(this, ...)
         in_swipe = true
-        local handled = orig_on_swipe(this, ...)
+        -- The flag has to come back down even when the handler throws. Left
+        -- up it refuses every later onClose, and nothing else ever clears it:
+        -- the chapter could not be closed at all, by any route, and only a
+        -- restart would get the reader out. The error is re-raised once the
+        -- flag is reset, so the failure still surfaces -- only the stuck state
+        -- is prevented. (error(..., 0) keeps the original message intact
+        -- instead of prefixing it with this wrapper's line number.)
+        local ok, handled = pcall(orig_on_swipe, this, ...)
         in_swipe = false
+        if not ok then error(handled, 0) end
         return handled
     end
     local orig_on_close = viewer.onClose
@@ -1355,8 +1630,17 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
     end
 
     -- Re-render the current page from scratch. Used to recover from a failed
-    -- load without making the reader navigate away and back by hand.
-    local function reloadCurrentPage()
+    -- load without making the reader navigate away and back by hand, and by
+    -- every setting that changes what a viewer slot means.
+    --
+    -- `why` names whoever asked, and only the log reads it. It is not
+    -- decoration: this call puts the screen under the reader through the whole
+    -- render path again, which on a spread is a 1.2 s decode, and a chapter's
+    -- log showed ten seconds of that with no way to tell what had asked for it
+    -- -- the settings that call this one log nothing of their own. One field
+    -- here is the difference between attributing that time and guessing at it.
+    local function reloadCurrentPage(why)
+        log("reload: %s", why or "unspecified")
         local current = viewer._images_list_cur
         if not current then return end
         viewer._images_list_cur = nil -- defeat switchToImageNum's no-op check
@@ -1375,10 +1659,10 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
     --- cover offset and the split all renumber the slots, so the position and
     --- the total have to be remapped across the change; the source page under
     --- the reader is the thing that stays fixed.
-    local function applyDisplayModeChange(source_page)
+    local function applyDisplayModeChange(source_page, why)
         viewer._images_list_nb = slotCount()
         viewer._images_list_cur = firstSlotOfSource(source_page)
-        reloadCurrentPage()
+        reloadCurrentPage(why)
     end
 
     --- Flips the rotation and puts the result on screen.
@@ -1420,11 +1704,11 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
         if renumbered then
             viewer._images_list_nb = slotCount()
             viewer._images_list_cur = firstSlotOfSource(src)
-            reloadCurrentPage()
+            reloadCurrentPage("rotation (re-pairing)")
         elseif G_reader_settings:isTrue(AUTOCROP_KEY) then
             -- Cropping is skipped while the view is rotated (see renderSlot),
             -- so with it on the page really does have to be rendered again.
-            reloadCurrentPage()
+            reloadCurrentPage("rotation (crop re-measure)")
         else
             -- Nothing that changes which buffer this page is: the re-render
             -- would decode a byte-for-byte identical one. update() re-uses the
@@ -1475,7 +1759,7 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
                             -- Chosen by hand, so it outlives this chapter: the
                             -- entry sync only drops rotation-made values.
                             G_reader_settings:saveSetting(DUAL_AUTO_KEY, false)
-                            applyDisplayModeChange(src)
+                            applyDisplayModeChange(src, "two-pages")
                             UIManager:setDirty(dialog, "ui")
                         end,
                     },
@@ -1494,7 +1778,7 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
                                 G_reader_settings:saveSetting(DUAL_AUTO_KEY, false)
                             end
                             G_reader_settings:saveSetting(SPLIT_KEY, want)
-                            applyDisplayModeChange(src)
+                            applyDisplayModeChange(src, "split")
                             -- Same repaint note as the row above: this changes
                             -- whether the dual-page and direction rows are
                             -- live, and a tap only repaints its own.
@@ -1511,7 +1795,17 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
                         end,
                         callback = function()
                             G_reader_settings:saveSetting(DUAL_RTL_KEY, not rtlReading())
-                            reloadCurrentPage()
+                            -- The halves are named by position in the pair, not
+                            -- by where they sit on the sheet, so flipping the
+                            -- direction swaps which physical half each key
+                            -- stands for -- while half_crop_cache holds a box
+                            -- measured on the other one. Left in place it would
+                            -- trim this half by the other half's margins. Dropped
+                            -- rather than re-keyed: the next render measures it
+                            -- again, once. crop_cache is deliberately untouched,
+                            -- because a whole sheet does not move.
+                            half_crop_cache = {}
+                            reloadCurrentPage("right-to-left")
                         end,
                     },
                 },
@@ -1526,7 +1820,7 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
                         callback = function()
                             local src = currentSourcePage()
                             G_reader_settings:flipNilOrFalse(DUAL_COVER_KEY)
-                            applyDisplayModeChange(src)
+                            applyDisplayModeChange(src, "cover-first")
                         end,
                     },
                 },
@@ -1542,6 +1836,24 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
     local schedulePrefetch
     local function prefetchNext()
         if closed then return end
+        -- Cheap link check before anything else. DNS resolution sits outside
+        -- every socket timeout in this file and measured 20 s on this device,
+        -- so a fetch launched with no link is not a failed request but a frozen
+        -- UI thread. isConnected() is a sysfs read plus an getifaddrs walk and
+        -- costs nothing to ask. Deliberately not isOnline(), which is a DNS
+        -- query of its own -- the very cost being avoided (see reportProgress).
+        local NetworkMgr = require("ui/network/manager")
+        if not NetworkMgr:isConnected() then
+            log("prefetch: no link, staying idle")
+            return
+        end
+        -- Circuit break in effect: leave the chain down for PREFETCH_COOLDOWN
+        -- after PREFETCH_FAIL_MAX failures in a row. Retrying on every page
+        -- turn against a link already known to be bad is what turned four slow
+        -- requests into 91 seconds of unresponsive UI in one measured session.
+        if now() < prefetch_gate_until then
+            return
+        end
         -- The fetch below is a synchronous HTTP request: it owns the UI thread
         -- for its whole duration, so anything the reader touches meanwhile just
         -- queues up. That is exactly the wrong time to hold the thread when a
@@ -1599,6 +1911,7 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
         if target == nil then return end
         local data = fetchPageData(target, true)
         if data then
+            prefetch_fails = 0
             cacheStore(target, data)
             diskCachePut(pageKey(target), data)
             if cache[target] == nil then
@@ -1610,6 +1923,16 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
                 return
             end
             schedulePrefetch(PREFETCH_CHAIN_DELAY)
+        else
+            -- Counted towards the circuit break above. A lone failure costs
+            -- nothing extra: the gate only refuses future launches, and a
+            -- successful fetch resets the count.
+            prefetch_fails = prefetch_fails + 1
+            if prefetch_fails >= PREFETCH_FAIL_MAX then
+                prefetch_gate_until = now() + PREFETCH_COOLDOWN
+                log("prefetch: %d failures in a row, standing down for %d s",
+                    prefetch_fails, PREFETCH_COOLDOWN)
+            end
         end
     end
     --- Called with no argument after a page turn (settle first), and with
@@ -1636,7 +1959,7 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
                 if closed or viewer._images_list_cur ~= image_num then return end
                 if cache[index] ~= nil then return end
                 log("page %d: retrying after failure", index)
-                reloadCurrentPage()
+                reloadCurrentPage("retry after failure")
             end)
         end
         schedulePrefetch()
@@ -1735,7 +2058,7 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
                         -- the widget it just built and resample the same buffer
                         -- again, plus one more full-screen refresh. The tick in
                         -- this button's own checkbox is repainted by the tap.
-                        reloadCurrentPage()
+                        reloadCurrentPage("auto-crop")
                     end,
                 },
                 {
@@ -1818,7 +2141,13 @@ function OPDSPSE:jumpToPage(viewer, count, current_source, to_slot)
                         local page_num = input_dialog:getInputValue()
                         if page_num then
                             UIManager:close(input_dialog)
-                            local target = math.min(math.max(1, page_num), total)
+                            -- floor before the clamp: input_type="number" hands
+                            -- back tonumber(text), so a reader who types "12.5"
+                            -- gets a fractional page. firstSlotOfSource() counts
+                            -- with an integer loop, and a fraction steps through
+                            -- it zero times -- the jump would land somewhere
+                            -- else entirely, without a word about it.
+                            local target = math.floor(math.min(math.max(1, page_num), total))
                             viewer:switchToImageNum(to_slot and to_slot(target) or target)
                         end
                     end,
