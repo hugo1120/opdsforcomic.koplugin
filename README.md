@@ -13,7 +13,7 @@ An OPDS client for KOReader: read comics from a server, with page prefetching, t
 
 ### 这是什么
 
-从 OPDS 服务器（Suwayomi、Kavita、Komga 等）直接看漫画，不用先下载到本地。派生自 KOReader 内置的 `opds.koplugin`，两者可同时启用。
+从 OPDS 服务器（Suwayomi、Komga 等，部署方式见文末[服务端](#服务端)）直接看漫画，不用先下载到本地。派生自 KOReader 内置的 `opds.koplugin`，两者可同时启用。
 
 - **翻页不看转圈**：提前抓取后续页，内存缓存 16 MB，可选磁盘缓存（默认关，上限 64 MB）。
 - **自动去掉白边**（默认关）。
@@ -65,7 +65,18 @@ An OPDS client for KOReader: read comics from a server, with page prefetching, t
 └────────────────────────────────────────┘
 ```
 
-地址要带全 `/api/opds/v1.2`，只写到 `/api/opds` 或 `/opds` 会返回 404。用户名密码通常留空。
+**地址格式取决于你用的服务器，两者不一样**（假设服务器在 `192.168.1.5`）：
+
+| 服务器 | 地址 | 默认端口 |
+|---|---|---|
+| **Suwayomi** | `http://192.168.1.5:4567/api/opds/v1.2` | 4567 |
+| **Komga** | `http://192.168.1.5:25600/opds/v1.2/catalog` | 25600 |
+
+两个都要注意：
+
+- **结尾不能少写**。Suwayomi 要带 `/api/opds/v1.2`（只写到 `/api/opds` 或 `/opds` 返回 404）；Komga 要带 `/opds/v1.2/catalog`（`/catalog` 是路径的一部分）。
+- **Komga 必须用 `v1.2`，不要用 `v2`。** Komga 也提供 `/opds/v2/catalog`，但 KOReader 在 v2 下不支持页流：Komga 官方兼容表里，v2 那一行 KOReader 的「流式传输」是否，v1.2 那一行才是是。本插件的预取和逐页加载依赖页流，填 v2 就退化成整本下载。
+- 用户名密码按服务器实际情况填：**Komga 用你的 Komga 账号**（它的 OPDS 走 Basic Auth，没有账号就留空）；**Suwayomi** 只在服务端开了登录保护（`AUTH_MODE=basic_auth`）时才需要填。
 
 #### ② 建一个快捷方式
 
@@ -173,6 +184,45 @@ An OPDS client for KOReader: read comics from a server, with page prefetching, t
 **关闭阅读界面后，服务器上的进度为什么变了？**
 缓存命中率高时真实请求很少，服务器记的进度会停住，所以关闭时会补发一次进度。
 
+### 服务端
+
+本插件是客户端，需要你自己有一个 OPDS 服务器。以下两个都经过实机验证。
+
+#### Suwayomi
+
+[github.com/Suwayomi/Suwayomi-Server](https://github.com/Suwayomi/Suwayomi-Server) —— 桌面版漫画服务器（Tachiyomi/Mihon 的重写），带内置扩展商店，可以直接在里面装图源。
+
+Docker 部署（官方 compose 示例见 [docker-tachidesk](https://github.com/Suwayomi/docker-tachidesk)）：
+
+```bash
+docker run -d --name suwayomi \
+  -p 4567:4567 \
+  -v /path/to/data:/home/suwayomi/.local/share/Tachidesk \
+  ghcr.io/suwayomi/suwayomi-server:preview
+```
+
+装完后浏览器打开 `http://<主机>:4567` 完成初始化、装图源。插件里填 `http://<主机>:4567/api/opds/v1.2`。
+
+#### Komga
+
+[github.com/gotson/komga](https://github.com/gotson/komga) —— 面向漫画/杂志/电子书的媒体服务器，扫描你**已有的**文件目录（不联网抓取），支持 OPDS、Kobo Sync、KOReader Sync。官网 [komga.org](https://komga.org)。
+
+Docker 部署（完整说明见 [komga.org/docs/installation/docker](https://komga.org/docs/installation/docker)）：
+
+```bash
+docker run -d --name komga \
+  --user 1000:1000 \
+  -p 25600:25600 \
+  -v /path/to/config:/config \
+  -v /path/to/data:/data \
+  --restart unless-stopped \
+  gotson/komga
+```
+
+`--user 1000:1000` 用你宿主机的 `id <用户名>` 结果替换，否则挂载目录会出现权限问题。`/data` 选一个同时放书和导入位置的文件夹。装完后浏览器打开 `http://<主机>:25600`，新建一个库指向你的漫画目录。插件里填 `http://<主机>:25600/opds/v1.2/catalog`。
+
+> 两者取向不同：**Suwayomi** 自带图源、能在线抓取更新，适合追连载；**Komga** 只管你本地已有的文件，元数据和阅读进度管理更细。
+
 ### 许可
 
 **AGPL-3.0**，全文见 [LICENSE](LICENSE)。本插件派生自 KOReader 内置的 `opds.koplugin`（AGPL-3.0）。
@@ -187,7 +237,7 @@ An OPDS client for KOReader: read comics from a server, with page prefetching, t
 
 ### What this is
 
-Read comics straight from an OPDS server (Suwayomi, Kavita, Komga, …) without downloading them first. A fork of KOReader's bundled `opds.koplugin`; both can be enabled at once.
+Read comics straight from an OPDS server (Suwayomi, Komga, … — see [the server side](#the-server-side) at the end) without downloading them first. A fork of KOReader's bundled `opds.koplugin`; both can be enabled at once.
 
 - **No spinner between pages**: the next pages are fetched ahead of you — 16 MB in RAM, plus an optional disk cache (off by default, 64 MB).
 - **Automatic margin cropping** (off by default).
@@ -239,7 +289,18 @@ Open the menu at the top left, then `Add catalog`:
 └────────────────────────────────────────┘
 ```
 
-The address needs the full `/api/opds/v1.2`; stopping at `/api/opds` or `/opds` returns a 404. Username and password are usually left empty.
+**The address differs between servers** (assuming the server is at `192.168.1.5`):
+
+| Server | Address | Default port |
+|---|---|---|
+| **Suwayomi** | `http://192.168.1.5:4567/api/opds/v1.2` | 4567 |
+| **Komga** | `http://192.168.1.5:25600/opds/v1.2/catalog` | 25600 |
+
+Two things to watch on both:
+
+- **The path has to be complete.** Suwayomi needs `/api/opds/v1.2` — stopping at `/api/opds` or `/opds` returns a 404. Komga needs `/opds/v1.2/catalog`; `/catalog` is part of the path.
+- **On Komga, use `v1.2`, not `v2`.** Komga also serves `/opds/v2/catalog`, but KOReader does not support page streaming over v2 (Komga's own compatibility table lists page streaming as **No** for KOReader on v2), and this plugin's prefetching and per-page loading depend on it. The v1.2 row is the one that says **Yes**.
+- Username and password depend on the server: **Komga wants your Komga account** (its OPDS uses Basic Auth; leave them empty if the server has no account); **Suwayomi** needs them only when the server has login protection on (`AUTH_MODE=basic_auth`).
 
 #### ② Make a shortcut
 
@@ -346,6 +407,45 @@ It is off by default. On, it saves re-downloading, at the cost of up to 64 MB of
 
 **Why did my position on the server change after closing the reader?**
 A high cache hit rate means very few real requests, so the server's recorded position stalls; closing the viewer sends one report to catch it up.
+
+### The server side
+
+This plugin is the client; you need an OPDS server of your own. These two are the ones it has been tested against.
+
+#### Suwayomi
+
+[github.com/Suwayomi/Suwayomi-Server](https://github.com/Suwayomi/Suwayomi-Server) — a desktop manga server (a rewrite of Tachiyomi/Mihon) with a built-in extension store, so sources are installed from inside it.
+
+Docker (official compose example in [docker-tachidesk](https://github.com/Suwayomi/docker-tachidesk)):
+
+```bash
+docker run -d --name suwayomi \
+  -p 4567:4567 \
+  -v /path/to/data:/home/suwayomi/.local/share/Tachidesk \
+  ghcr.io/suwayomi/suwayomi-server:preview
+```
+
+Then open `http://<host>:4567` in a browser to finish setup and install sources. In the plugin, enter `http://<host>:4567/api/opds/v1.2`.
+
+#### Komga
+
+[github.com/gotson/komga](https://github.com/gotson/komga) — a media server for comics, magazines and eBooks that scans files **you already have** (it does not fetch anything). Supports OPDS, Kobo Sync and KOReader Sync. Website: [komga.org](https://komga.org).
+
+Docker (full instructions at [komga.org/docs/installation/docker](https://komga.org/docs/installation/docker)):
+
+```bash
+docker run -d --name komga \
+  --user 1000:1000 \
+  -p 25600:25600 \
+  -v /path/to/config:/config \
+  -v /path/to/data:/data \
+  --restart unless-stopped \
+  gotson/komga
+```
+
+Replace `--user 1000:1000` with the output of `id <your_user>` on the host, or the mounted folders will hit permission problems. Pick a `/data` folder that holds both your books and the import location. Then open `http://<host>:25600` and add a library pointing at your comics. In the plugin, enter `http://<host>:25600/opds/v1.2/catalog`.
+
+> They answer different questions: **Suwayomi** brings its own sources and can fetch new chapters, which suits following ongoing series; **Komga** only serves files you already have, with finer control over metadata and reading progress.
 
 ### License
 
