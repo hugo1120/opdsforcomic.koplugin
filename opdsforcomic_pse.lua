@@ -653,6 +653,10 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
     -- the chain forever — the next page turn re-arms it anyway.
     local prefetch_deferrals = 0
     local last_failure_notice = 0
+    -- Whether the updateProgress rewrite in fetchPageData has been reported.
+    -- Once per chapter, not once per fetch: the rewrite is a property of the
+    -- catalog's template, so repeating it every prefetch would be noise.
+    local progress_flag_logged = false
 
     local function cacheCount()
         local n = 0
@@ -716,7 +720,35 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
     -- Blocking fetch. Returns the image bytes, or nil plus a reason.
     local function fetchPageData(index, is_prefetch)
         local page_url = remote_url:gsub("{pageNumber}", tostring(index))
+        -- Kept for the sake of catalogs that do offer a width placeholder, but
+        -- it does nothing on Suwayomi: the page endpoint takes only
+        -- updateProgress / format / opds, and the image is written out at its
+        -- stored resolution (Page.getPageImageServe -> ImageIO, no resize
+        -- anywhere). So the oversampling of large pages has no server-side fix
+        -- and the only lever left is decoding less of the JPEG.
         page_url = page_url:gsub("{maxWidth}", tostring(Screen:getWidth()))
+        -- A prefetch must not report progress. The catalog serves us the whole
+        -- page URL -- everything but the page number already filled in -- so
+        -- whatever it put in the query is passed through untouched. That is
+        -- right for a page the reader actually turned to, and wrong for a
+        -- prefetch, which serves pages they have not reached yet: on Suwayomi
+        -- updateProgress=true makes the server record the page just served as
+        -- the reading position and push it to KOReader sync, so a look-ahead of
+        -- a few pages parks the progress ahead of the reader, and a prefetch
+        -- that reaches the last page marks the whole chapter read.
+        --
+        -- The pattern keeps the query delimiter in a capture rather than
+        -- matching the parameter name bare, so a longer name that merely ends
+        -- in "updateProgress" cannot be hit, and whatever separator the
+        -- catalog used survives the rewrite.
+        if is_prefetch then
+            local before = page_url
+            page_url = page_url:gsub("([?&])updateProgress=[^&]*", "%1updateProgress=false")
+            if page_url ~= before and not progress_flag_logged then
+                progress_flag_logged = true
+                log("prefetch: updateProgress forced to false, page turns stay authoritative")
+            end
+        end
         local parsed = url.parse(page_url)
         if parsed.scheme ~= "http" and parsed.scheme ~= "https" then
             -- A prefetch failing this way is not worth interrupting the reader

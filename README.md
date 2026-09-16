@@ -202,11 +202,13 @@ local AUTOCROP_MAX_TRIM = 0.35    -- 单边最多裁掉这个比例
 
 **淘汰按「离当前页的距离」而非插入顺序。** 预取是先抓前、后抓后，若按插入顺序淘汰，内存紧张时会先把最该留的前向页挤掉。
 
-**内存占用** = `MEM_CACHE_LIMIT` × 单页大小。若页面很大（>2 MB），建议降到 3~4。
+**内存占用** = 页数 × 单页大小，页数由 `MEM_CACHE_MAX_BYTES`（16 MB）反过来决定。所以大页服务器自动少存几页，`MEM_CACHE_MIN_PAGES`（4 页）是下限。
 
 #### 关于 `MAX_DECODE_SCALE`
 
 默认关闭，因为它通常得不偿失。`ImageViewer` 的初始 `scale_factor` 是 0（"scaled for best fit"，见 `imageviewer.lua`），也就是说 `ImageWidget` 本来就会把整张图缩到屏幕大小。把上限设成屏幕的 3 倍会导致**缩两次**，CPU 反而更亏。设成 1 倍能让第二次缩放变成空操作并大幅降低单页驻留内存，代价是双指放大失去意义。只有当日志显示瓶颈是内存时，才值得改。
+
+**也别指望让服务器发小图。** Suwayomi 的页面端点只接受 `updateProgress` / `format` / `opds` 三个参数，图片按存储分辨率原样输出、没有任何缩放路径（`Page.getPageImageServe` 走 `ImageIO`）。所以大页超采样 3~4 倍是**没有服务端解法**的，代码里那行 `{maxWidth}` 替换只对少数别的目录有效。
 
 ### 日志
 
@@ -225,19 +227,25 @@ opdsforcomic: page 42: prefetch fetched 946605 bytes in 412 ms
 opdsforcomic: page 43: ready in 187 ms via mem
 opdsforcomic: page 44: ready in 530 ms via disk
 opdsforcomic: page 45: ready in 2310 ms via net
+opdsforcomic: prefetch: updateProgress forced to false, page turns stay authoritative
 ```
 
 `via` 后面的来源直接说明缓存有没有生效：`mem` / `disk` 是命中，`net` 是预取没赶上、只能现取。`net` 占比高说明网络仍是瓶颈。
 
+最后一行每章出现一次，出现在预取请求里的 `updateProgress` 参数被改写时（见更新日志 0.0.5）。
+
 ### 已知限制
 
-- **会推进服务端阅读进度。** Suwayomi 的 PSE 模板带 `updateProgress=true`，预取页也会计入。若不希望如此，可在 `fetchPageData` 中把预取请求的该参数改写为 `false`（未默认启用，因为 URL 改写不通用）。
 - **预取是阻塞式的。** KOReader 没有线程池，预取在主线程执行，超时为 6s/15s，最坏情况卡顿上限 15 秒。打开对话框时预取会主动让路（见上），但翻页路径本身仍然是同步的。彻底的解法是用 `socket.select` 做分片非阻塞下载，尚未实现。
 - **不继承上游更新。** 这是完整 fork，KOReader 对 `opds.koplugin` 的修复不会自动流入，升级后需手动重新合并。
 - **保留的原版行为**：Kavita 专用进度查询（`getLastPage`）对 Suwayomi 等非 Kavita 服务器会直接抛错并被 `pcall` 兜底为 0，因此始终从第 1 页开始。
 - **未实现 HTTP 连接复用。** 目前每页新建一次 TCP 连接。`socketutil.lua` 的注释指出，用自定义 `create` 函数处理 HTTPS 连接复用很容易出问题，因此没有贸然改动。
 
 ### 更新日志
+
+**0.0.5**
+
+- **修掉预取把服务端阅读进度推到读者前面。** Suwayomi 的页流模板把 `updateProgress=true` 硬编码在 URL 里（`.../page/{pageNumber}?updateProgress=true&opds=true`），插件原本原样透传。这本是**真实翻页**该做的，但对**预取**是错的——预取抓的是你还没翻到的页。后果有两层：服务端把往前几页记成你的阅读位置，于是**进度恒在你实际读到的位置之前**；预取一旦读到本章最后一页，**这一章会被标成已读**。另外每次预取都会触发一次 KOReader 同步推送。现在只要请求来自预取，该参数就改写为 `false`；真实翻页不受影响，进度照常上报。
 
 **0.0.4**
 
@@ -480,6 +488,8 @@ local AUTOCROP_MAX_TRIM = 0.35    -- never cut more than this off one side
 
 Off by default, because it usually costs more than it saves. `ImageViewer` starts at `scale_factor` 0 ("scaled for best fit", see `imageviewer.lua`), so `ImageWidget` scales the image down to the screen regardless. Capping at three times the screen size would make it scale twice, which is a net loss on CPU. A cap of exactly one times the screen makes the second scale a no-op and cuts the memory a page retains, but makes zooming in pointless. Worth revisiting only if the logs show memory rather than network or decode is the bottleneck.
 
+**Nor is there a way to ask the server for a smaller image.** Suwayomi's page endpoint takes only `updateProgress`, `format` and `opds`, and serves the image at its stored resolution with no resizing anywhere (`Page.getPageImageServe` goes through `ImageIO`). The 3–4x oversampling of large pages therefore has **no server-side fix**; the `{maxWidth}` substitution in the code only helps against the few catalogs that offer a width placeholder.
+
 ### Logging
 
 Plugin output is prefixed with `opdsforcomic:`. **The default level is `info`, so debug output is suppressed** until you enable it:
@@ -497,19 +507,25 @@ opdsforcomic: page 42: prefetch fetched 946605 bytes in 412 ms
 opdsforcomic: page 43: ready in 187 ms via mem
 opdsforcomic: page 44: ready in 530 ms via disk
 opdsforcomic: page 45: ready in 2310 ms via net
+opdsforcomic: prefetch: updateProgress forced to false, page turns stay authoritative
 ```
 
 The `via` field tells you whether caching is working: `mem` and `disk` are hits, `net` means the prefetch did not get there in time. A high proportion of `net` means the network is still the bottleneck.
 
+The last line appears once per chapter, when the `updateProgress` parameter of a prefetch request has been rewritten (see the 0.0.5 changelog entry).
+
 ### Known Limitations
 
-- **It advances server-side reading progress.** Suwayomi's PSE template carries `updateProgress=true`, and prefetched pages count. To avoid it, rewrite that parameter to `false` for prefetch requests in `fetchPageData` (not enabled by default, since rewriting URLs is not portable across servers).
 - **Prefetching is blocking.** KOReader has no thread pool, so prefetches run on the main thread. Timeouts are 6 s / 15 s, bounding the worst-case stall at fifteen seconds. A prefetch now stands aside while a dialog is open (see above), but the page-turn path itself is still synchronous. The thorough fix is chunked non-blocking downloads with `socket.select`, not implemented.
 - **Upstream fixes do not flow in.** This is a full fork; KOReader's fixes to `opds.koplugin` will not arrive automatically and must be merged by hand.
 - **Inherited behaviour**: the Kavita-specific progress lookup (`getLastPage`) throws on non-Kavita servers such as Suwayomi and is caught by `pcall`, so streaming always starts at page 1.
 - **No HTTP connection reuse.** Each page opens a new TCP connection. The comment in `socketutil.lua` warns that connection reuse via a custom `create` function is error-prone under HTTPS, so it was left alone.
 
 ### Changelog
+
+**0.0.5**
+
+- **Fixed prefetching pushing the server's reading position ahead of the reader.** Suwayomi's page template hard-codes `updateProgress=true` into the URL (`.../page/{pageNumber}?updateProgress=true&opds=true`) and the plugin passed it through untouched. That is right for a page the reader actually turned to, and wrong for a prefetch, which serves pages they have not reached yet. Two consequences: the pages fetched ahead are what the server records as the reading position, so **progress sits ahead of where the reader actually is**, and a prefetch that reaches the last page **marks the whole chapter read**. Each prefetch also triggered a KOReader sync push. A request that comes from the prefetcher now rewrites that parameter to `false`; real page turns are untouched and still report progress.
 
 **0.0.4**
 
