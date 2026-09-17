@@ -569,6 +569,86 @@ local function measureCrop(bb)
     return { x0, y0, x1, y1 }
 end
 
+--- Tone: the "washed-out" / "too dark" cure, as one gamma slider.
+---
+--- Linear contrast (raise the numbers) needs a negative offset for the bright
+--- side, and no BlitBuffer C primitive accepts one. A gamma curve,
+--- out = 255*(in/255)^g does what the two complaints actually want: over 1
+--- darkens the midtones, under 1 brightens them, black and white stay put.
+--- fz_gamma_pixmap is that curve in C; KOReader's PDF reader exposes it as
+--- its Contrast slider.
+---
+--- Verified on this device by a throwaway probe before writing any of this:
+--- a plugin may ffi.loadlib("wrap-mupdf") and build its own fz_context (the
+--- version string must match the library, so it is read out of ffi/mupdf.lua
+--- rather than hardcoded); and one pass over a half-page (1994x3000) measured
+--- ~54 ms. The probe only stood up the gray path (TYPE_BB8, JPEG pages via
+--- TurboJPEG); PNG pages take MuPDF's renderImage, which hands back BBRGB24,
+--- so that path is driven with fz_device_rgb on the same layout assumption
+--- (stride walked as given) and is being validated on device now.
+local DARKEN_KEY = "opdsforcomic_darken"
+local DARKEN_DEFAULT = 1.0
+
+--- The gammas the tone control walks through, brightest first.
+---
+--- One list rather than a range, because the two directions cannot share a
+--- step. Brightening is steep -- 0.5 is already obvious on a scan -- so 0.1 is
+--- the useful resolution and the whole bright side is five rungs. Darkening is
+--- flat near white: a pow curve with g > 1 mostly eats midtones, so a white 240
+--- only falls to 226 at g=2 and 200 at g=4, which means the number has to look
+--- absurd before e-ink shows anything -- and walking up there at 0.1 would cost
+--- about ninety taps to cross. Hence the coarse 1.0 ladder above 1.0.
+---
+--- Handed to the SpinWidget as a value_table of *strings*: the widget prints a
+--- table entry exactly as it stands, so "1.0" survives as "1.0" rather than the
+--- "1" Lua's tostring would make of it.
+local TONE_LEVELS = {
+    "0.5", "0.6", "0.7", "0.8", "0.9", -- brightening: steep, so fine steps
+    "1.0",                             -- untouched
+    "2", "3", "4", "5", "6", "7", "8", "9", "10", -- darkening: flat, so coarse
+}
+--- Where "1.0" sits in the list above, and where a fresh reader starts.
+local TONE_DEFAULT_INDEX = 6
+
+--- Where `gamma` sits on that ladder.
+---
+--- A value off the ladder -- saved by a build whose control was a plain range,
+--- or typed into settings.reader.lua by hand -- lands on the nearest rung
+--- instead of falling off it, so the dialog always opens on something it can
+--- offer. Ties go to the lower rung, which is the one that darkens less.
+local function toneIndex(gamma)
+    local best, best_gap = TONE_DEFAULT_INDEX, math.huge
+    for i = 1, #TONE_LEVELS do
+        local gap = math.abs(tonumber(TONE_LEVELS[i]) - gamma)
+        if gap < best_gap then
+            best, best_gap = i, gap
+        end
+    end
+    return best
+end
+
+--- The reader's gamma. 1.0 is "leave it alone". The type check covers both the
+--- first shipped build, which stored a boolean here, and a hand-edited
+--- settings.reader.lua holding a string: neither is a gamma, and either one
+--- would otherwise reach the curve -- or the ladder, which subtracts it.
+local function gammaValue()
+    local v = G_reader_settings:readSetting(DARKEN_KEY, DARKEN_DEFAULT)
+    if type(v) ~= "number" then return DARKEN_DEFAULT end
+    return v
+end
+
+--- Assigned the real FFI implementation below -- after renderSlot on purpose,
+--- so the render path stays testable without a device; a test injects a mock.
+local darkenBuffer = nil
+
+--- Applies the curve to a freshly decoded sheet, in place. Returns the sheet
+--- unchanged (nil for "nothing happened" so the caller can tell) when the
+--- backer cannot run. Never fails the page.
+local function applyDarken(bb, gamma_value)
+    if not darkenBuffer then return nil end
+    return darkenBuffer(bb, gamma_value)
+end
+
 local function cropTo(bb, box)
     local w, h = box[3] - box[1], box[4] - box[2]
     if w <= 0 or h <= 0 then return nil end
@@ -720,7 +800,36 @@ local function renderSlot(data, index, half, rotated, crop_cache, half_crop_cach
         return nil, false
     end
     local decode_ms = elapsedMs(started)
+    local gamma_ms, darken_ok = 0, false
     local cut_ms, crop_ms, keep_ms = 0, 0, 0
+    local gamma_value = gammaValue()
+
+    --- Curves one finished buffer, timing it. A missing or failing backend
+    --- leaves the page as it is, never fails it.
+    ---
+    --- Applied on the way out, never to the sheet on the way in. The crop has to
+    --- measure the pixels the scan actually has: autoCrop calls a sample "ink"
+    --- below a fixed threshold (240 - 0.6*64 = 201.6), and a sheet curved first
+    --- moves its own background under that line -- white sits at 226 at gamma 2,
+    --- 213 at 3 and 200 at 4 -- so from 4 upwards every margin sample counts as
+    --- content, the box becomes the whole page, the gain check fails and the
+    --- crop quietly stops doing anything. Which is precisely the range this
+    --- control exists for. Curving afterwards is cheaper too: the halves it runs
+    --- on are already cut and capped.
+    ---
+    --- Every buffer that leaves here carries the curve, the stashed one
+    --- included, or the next page turn would show the same sheet both ways.
+    local function tone(buffer)
+        if not buffer or gamma_value == DARKEN_DEFAULT then return buffer end
+        local gm_started = now()
+        local darkened = applyDarken(buffer, gamma_value)
+        gamma_ms = gamma_ms + elapsedMs(gm_started)
+        if darkened then
+            darken_ok = true
+            return darkened
+        end
+        return buffer
+    end
 
     -- Measured on the sheet, before anything is trimmed off it: the ratio is
     -- what the verdict rests on, and a crop would move it. Rotation turns the
@@ -777,8 +886,10 @@ local function renderSlot(data, index, half, rotated, crop_cache, half_crop_cach
                 -- The cap sits outside the timed windows: it belongs to the
                 -- buffer either way, and at MAX_DECODE_SCALE 0 it is a no-op.
                 bb = fitToDecodeBudget(bb, label)
+                bb = tone(bb)
                 if other then
                     other = fitToDecodeBudget(other, other_label)
+                    other = tone(other)
                     -- The eviction this may cause is logged by stashHalf itself,
                     -- so a back turn that still decodes can be read from the log.
                     if stash then
@@ -799,6 +910,9 @@ local function renderSlot(data, index, half, rotated, crop_cache, half_crop_cach
                     local kept = copyBlitbuffer(bb)
                     keep_ms = elapsedMs(keep_started)
                     if kept then stash(mine_key, kept) end
+                end
+                if darken_ok then
+                    log("%s: darken %d ms, gamma %.1f", label, gamma_ms, gamma_value)
                 end
                 log("%s: decode %d ms, cut %d ms, crop %d ms, keep %d ms%s", label,
                     decode_ms, cut_ms, crop_ms, keep_ms, fused and " (fused clip)" or "")
@@ -821,6 +935,10 @@ local function renderSlot(data, index, half, rotated, crop_cache, half_crop_cach
         crop_ms = elapsedMs(crop_started)
     end
     bb = fitToDecodeBudget(bb, label)
+    bb = tone(bb)
+    if darken_ok then
+        log("%s: darken %d ms, gamma %.1f", label, gamma_ms, gamma_value)
+    end
     log("%s: decode %d ms, cut %d ms, crop %d ms, keep %d ms%s", label,
         decode_ms, cut_ms, crop_ms, keep_ms,
         rotated and " (rotated, crop skipped)" or "")
@@ -828,6 +946,114 @@ local function renderSlot(data, index, half, rotated, crop_cache, half_crop_cach
 end
 
 -- This function attempts to pull chapter progress from Kavita.
+
+--- The real darkenBuffer: an in-place gamma pass through MuPDF.
+---
+--- Every step that can fail returns nil and leaves the page un-darkened,
+--- with a log line naming what was missing; the failure modes that exist on
+--- devices are a missing wrap-mupdf or an fz_context the library refuses.
+--- Shown pages are never the thing that breaks.
+local pse_ffi = require("ffi")
+local pse_blitbuffer = require("ffi/blitbuffer")
+local pse_cdef_ok, pse_lib, pse_ctx, pse_gray, pse_rgb
+
+local function pseFindModule(name)
+    local rel = name:gsub("%.", "/")
+    for pattern in package.path:gmatch("[^;]+") do
+        local path = pattern:gsub("%?", function() return rel end)
+        local f = io.open(path, "r")
+        if f then
+            f:close()
+            return path
+        end
+    end
+end
+
+local function pseFzVersion()
+    local f = io.open(pseFindModule("ffi.mupdf"), "r")
+    if not f then return nil end
+    local src = f:read("*a")
+    f:close()
+    return src and src:match('FZ_VERSION%s*=%s*"([^"]+)"') or nil
+end
+
+local function pseGammaContext()
+    if pse_ctx then return pse_ctx end
+    if not pse_cdef_ok then
+        pse_cdef_ok = pcall(pse_ffi.cdef, [[
+            fz_context *fz_new_context_imp(const fz_alloc_context *, const fz_locks_context *, size_t, const char *);
+            void fz_drop_context(fz_context *);
+            fz_colorspace *fz_device_gray(fz_context *);
+            fz_colorspace *fz_device_rgb(fz_context *);
+            fz_pixmap *mupdf_new_pixmap_with_data(fz_context *, fz_colorspace *, int, int, fz_separations *, int, int, unsigned char *);
+            void fz_gamma_pixmap(fz_context *, fz_pixmap *, float);
+            void fz_drop_pixmap(fz_context *, fz_pixmap *);
+        ]])
+        if not pse_cdef_ok then return nil end
+    end
+    local ok, lib = pcall(pse_ffi.loadlib, "wrap-mupdf")
+    if not ok or not lib then
+        logger.dbg(string.format("opdsforcomic: tone unavailable: wrap-mupdf (%s)", tostring(lib)))
+        return nil
+    end
+    local version = pseFzVersion()
+    local ctx = version and lib.fz_new_context_imp(nil, nil, 32 * 1024 * 1024, version) or nil
+    if ctx == nil or ctx == pse_ffi.NULL then
+        logger.dbg("opdsforcomic: tone unavailable: no fz_context (version mismatch?)")
+        return nil
+    end
+    pse_lib, pse_ctx = lib, ctx
+    pse_gray = lib.fz_device_gray(ctx)
+    pse_rgb = lib.fz_device_rgb(ctx)
+    return pse_ctx
+end
+
+--- The colorspace/alpha pair must match the buffer's own channels or every
+--- pixel after the first row lands on the wrong bytes. The gray pair was stood
+--- up on device by the probe; the RGB pairs follow the same layout rule
+--- (stride walked as given) and are being confirmed on device with this build.
+darkenBuffer = function(bb, gamma_value)
+    if not bb then return nil end
+    local t = bb:getType()
+    local colorspace, alpha
+    if t == pse_blitbuffer.TYPE_BB8 then
+        colorspace, alpha = pse_gray, 0
+    elseif t == pse_blitbuffer.TYPE_BB8A then
+        colorspace, alpha = pse_gray, 1
+    elseif t == pse_blitbuffer.TYPE_BBRGB24 then
+        colorspace, alpha = pse_rgb, 0
+    elseif t == pse_blitbuffer.TYPE_BBRGB32 then
+        colorspace, alpha = pse_rgb, 1
+    else
+        logger.dbg(string.format("opdsforcomic: tone skipped, unhandled buffer type %s",
+            tostring(t)))
+        return nil
+    end
+    local ctx = pseGammaContext()
+    if not ctx then return nil end
+    local pix = pse_lib.mupdf_new_pixmap_with_data(ctx, colorspace,
+        bb:getWidth(), bb:getHeight(), nil, alpha, bb.stride,
+        pse_ffi.cast("unsigned char*", bb.data))
+    if pix == nil then
+        logger.dbg("opdsforcomic: tone skipped: no pixmap (memory?)")
+        return nil
+    end
+    local ok = pcall(function()
+        pse_lib.fz_gamma_pixmap(ctx, pix, gamma_value)
+    end)
+    pcall(function()
+        pse_lib.fz_drop_pixmap(ctx, pix)
+    end)
+    if not ok then
+        logger.dbg("opdsforcomic: tone skipped: fz_gamma_pixmap failed")
+        return nil
+    end
+    logger.dbg(string.format("opdsforcomic: tone applied, type %s, gamma %.1f, %dx%d",
+        tostring(t), gamma_value,
+        bb:getWidth(), bb:getHeight()))
+    return bb
+end
+
 function OPDSPSE:getLastPage(remote_url, username, password)
     local last_page = 0
 
@@ -2007,7 +2233,7 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
                 {
                     -- id "scale" is required by ImageViewer:update()
                     id = "scale",
-                    text = viewer._scale_to_fit and _("Original size") or _("Scale"),
+                    icon = "appbar.pagefit",
                     callback = function()
                         viewer.scale_factor = viewer._scale_to_fit and 1 or 0
                         viewer._scale_to_fit = not viewer._scale_to_fit
@@ -2019,7 +2245,7 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
                 {
                     -- id "rotate" is required by ImageViewer:update()
                     id = "rotate",
-                    text = viewer.rotated and _("No rotation") or _("Rotate"),
+                    icon = "appbar.rotation",
                     -- toggleRotation also turns dual-page on and off with the
                     -- rotation, so it may have to re-pair the pages and redraw.
                     -- When neither the pairing nor the crop changed, it only
@@ -2029,7 +2255,7 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
                 },
                 {
                     id = "goto",
-                    text = L("Go to", "跳转"),
+                    icon = "appbar.search",
                     -- Both numbers are read at tap time: the split learns what
                     -- each sheet holds as it reads, so where the reader is moves
                     -- during a chapter even though the total does not.
@@ -2039,12 +2265,12 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
                 },
                 {
                     id = "crop",
-                    text = L("Crop", "裁剪"),
-                    -- Button appends a checkmark when this is true, evaluated
-                    -- at paint time, so no manual label refresh is needed.
-                    checked_func = function()
-                        return G_reader_settings:isTrue(AUTOCROP_KEY)
-                    end,
+                    icon = "appbar.crop",
+                    -- The checkmark is gone along with the text. Button paints
+                    -- a ✓ by appending to its text and refreshing the label
+                    -- with setText(), and an icon button's label is an
+                    -- IconWidget, which has no setText -- keeping the
+                    -- checked_func would crash on the very tap that toggles it.
                     callback = function()
                         G_reader_settings:flipNilOrFalse(AUTOCROP_KEY)
                         -- the setting changed, so measure again
@@ -2062,8 +2288,70 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
                     end,
                 },
                 {
+                    id = "darken",
+                    icon = "appbar.contrast",
+                    callback = function()
+                        -- Re-renders the current page on close only, not per
+                        -- tick: a tick is a ~1.3 s decode-and-crop, far too slow
+                        -- to sit inside the widget's feedback loop. The number
+                        -- in the middle is the feedback.
+                        local SpinWidget = require("ui/widget/spinwidget")
+                        -- What the page underneath was drawn with. Closing
+                        -- without moving the control is a common way out of this
+                        -- dialog, and it used to buy a full decode to redraw a
+                        -- page that was already right -- three times in one
+                        -- measured session. Compared against the saved setting
+                        -- rather than the widget's own number, because the
+                        -- setting is what reaches the renderer.
+                        local before = gammaValue()
+                        UIManager:show(SpinWidget:new{
+                            title_text = L("Tone", "明暗"),
+                            info_text = L("1.0 is untouched: above darkens, below brightens. The steps above 1.0 are coarse because a small gamma is invisible on e-ink.",
+                                          "1.0 为原样：大于 1 加深，小于 1 提亮。1.0 以上的档位跨度大，因为小幅调整在墨水屏上看不出来。"),
+                            -- A value_table, not a range: the ladder carries two
+                            -- resolutions and one value_step cannot express both.
+                            -- The entries are what gets printed, which is also
+                            -- why they are strings -- "1.0" has to stay "1.0".
+                            value_table = TONE_LEVELS,
+                            value_index = toneIndex(gammaValue()),
+                            value_hold_step = 4, -- one hold crosses the bright side
+                            -- Deliberately not SpinWidget's own default_value
+                            -- button: with a value_table that button sets only
+                            -- value_index, while the picker prints and reports
+                            -- self.value -- so it would save the old gamma from
+                            -- under a label reading "Default value: 1.0". This
+                            -- one writes the setting itself; the close callback
+                            -- below is what re-renders.
+                            extra_text = L("Back to 1.0", "恢复原样 1.0"),
+                            extra_callback = function()
+                                G_reader_settings:saveSetting(DARKEN_KEY, DARKEN_DEFAULT)
+                            end,
+                            callback = function(spin)
+                                G_reader_settings:saveSetting(DARKEN_KEY, tonumber(spin.value))
+                            end,
+                            close_callback = function()
+                                -- The gamma actually in force, stated here rather
+                                -- than only inside the render pass: at 1.0 that
+                                -- pass is skipped and logs nothing at all, so a
+                                -- log without this line cannot tell "the control
+                                -- was left alone" from "the new value never
+                                -- reached the renderer".
+                                local after = gammaValue()
+                                log("tone: %.1f", after)
+                                if after == before then return end
+                                -- Finished pictures carry the old curve. The crop
+                                -- boxes do not: they are measured on untoned
+                                -- pixels now, so re-measuring them here would
+                                -- only spend that time a second time.
+                                dropStash()
+                                reloadCurrentPage("darken")
+                            end,
+                        })
+                    end,
+                },
+                {
                     id = "close",
-                    text = _("Close"),
+                    icon = "close",
                     callback = function() viewer:onClose() end,
                 },
             },
@@ -2071,6 +2359,16 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
         zero_sep = true,
         show_parent = viewer,
     }
+
+    -- ImageViewer:update() relabels the scale/rotate buttons via setText(),
+    -- which on these icon-carrying buttons would rebuild them as text buttons
+    -- (setText calls init() and swaps the label widget). The relabel exists to
+    -- flip a textual label the icons have replaced, so it is swallowed; the ids
+    -- themselves are still required by update(), and the wrapper keeps them.
+    for _, btn_id in ipairs({ "scale", "rotate" }) do
+        local btn = viewer.button_table:getButtonById(btn_id)
+        function btn:setText() end
+    end
     viewer.button_container = CenterContainer:new{
         dimen = Geom:new{
             w = viewer.width,

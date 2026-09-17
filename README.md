@@ -7,6 +7,25 @@ An OPDS client for KOReader: read comics from a server, with page prefetching, t
 
 ---
 
+<a id="screenshots"></a>
+
+### 实机截图 · Screenshots
+
+<table>
+<tr>
+<td width="50%"><a href="示范截图/screenshot_20260917_141119.png"><img src="示范截图/screenshot_20260917_141119.png" width="440" alt="Kobo 实机截图 1"></a></td>
+<td width="50%"><a href="示范截图/screenshot_20260917_141125.png"><img src="示范截图/screenshot_20260917_141125.png" width="440" alt="Kobo 实机截图 2"></a></td>
+</tr>
+<tr>
+<td width="50%"><a href="示范截图/screenshot_20260917_141133.png"><img src="示范截图/screenshot_20260917_141133.png" width="440" alt="Kobo 实机截图 3"></a></td>
+<td width="50%"><a href="示范截图/screenshot_20260917_141140.png"><img src="示范截图/screenshot_20260917_141140.png" width="440" alt="Kobo 实机截图 4"></a></td>
+</tr>
+</table>
+
+Kobo 墨水屏实机，点图看原图 · on a Kobo, tap an image for the full size.
+
+---
+
 <a id="中文"></a>
 
 ## 中文
@@ -119,7 +138,7 @@ An OPDS client for KOReader: read comics from a server, with page prefetching, t
 
 ### 阅读界面
 
-点击屏幕**中间三分之一**唤出底部按钮：
+点击屏幕**中间三分之一**唤出底部**图标工具栏**（和 KOReader 自带阅读界面一样的风格），从左到右：**适屏 / 旋转 / 跳页 / 裁剪 / 明暗 / 关闭**。
 
 ```
 ┌──────────────────────────────────────────┐
@@ -127,17 +146,18 @@ An OPDS client for KOReader: read comics from a server, with page prefetching, t
 │              漫 画 页 面                 │
 │                                          │
 ├──────────────────────────────────────────┤
-│ Scale  Rotate  Go to  Crop  Close        │
+│      底部一行是图标按钮                  │
 └──────────────────────────────────────────┘
 ```
 
-| 按钮 | 作用 |
-|---|---|
-| `Scale` | 适应屏幕 / 原始尺寸切换 |
-| `Rotate` | 旋转 90°，并自动切换双页。**长按**打开显示方式面板 |
-| `Go to` | 跳到指定页，输入框已预填当前页 |
-| `Crop` | 自动裁剪开关，开启后按钮带 ✓ |
-| `Close` | 关闭 |
+「明暗」：扫描发白或太暗时调它，认准原样 **1.0**：
+
+| 档位 | 0.5 ~ 0.9 | 1.0 | 2 ~ 10 |
+|---|---|---|---|
+| 步长 | 0.1 | — | 1.0 |
+| 效果 | 提亮 | 原样 | 加深 |
+
+提亮很敏感，0.1 一档才够用；加深很不敏感——白底 240 在 2.0 档只到 226、4.0 档才到 200，墨水屏上看不出来，所以上面这半跨度大、一直开到 10。JPEG / PNG / GIF / WebP / SVG 都支持。
 
 ### 显示方式面板
 
@@ -343,7 +363,7 @@ Back in the file manager the file sits in the list like any other. **Tapping it 
 
 ### The reading view
 
-Tap the **middle third** of the screen to bring up the buttons:
+Tap the **middle third** of the screen to bring up the bottom **icon toolbar** (same style as KOReader's own readers), left to right: **Scale / Rotate / Go to / Crop / Tone / Close**.
 
 ```
 ┌──────────────────────────────────────────┐
@@ -351,17 +371,18 @@ Tap the **middle third** of the screen to bring up the buttons:
 │               a comic page               │
 │                                          │
 ├──────────────────────────────────────────┤
-│ Scale  Rotate  Go to  Crop  Close        │
+│      bottom row is the icon toolbar      │
 └──────────────────────────────────────────┘
 ```
 
-| Button | What it does |
-|---|---|
-| `Scale` | Fit to screen / original size |
-| `Rotate` | Rotate 90°, which also toggles two-page. **Long press** opens the display panel |
-| `Go to` | Jump to a page; the box is pre-filled with the current one |
-| `Crop` | Auto-crop toggle, shows ✓ when on |
-| `Close` | Close |
+**Tone**: for washed-out or too-dark scans. **1.0** is untouched:
+
+| Value | 0.5 – 0.9 | 1.0 | 2 – 10 |
+|---|---|---|---|
+| Step | 0.1 | — | 1.0 |
+| Effect | brightens | untouched | darkens |
+
+Brightening shows at once, so it needs the fine step; darkening barely shows on e-ink — a white 240 only reaches 226 at 2.0 and 200 at 4.0 — so the top half is coarse and goes up to 10. Works on JPEG / PNG / GIF / WebP / SVG.
 
 ### The display panel
 
