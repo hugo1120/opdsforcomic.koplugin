@@ -77,6 +77,10 @@ Kobo 墨水屏实机，点图看原图 · on a Kobo, tap an image for the full s
 - **Suwayomi**（[github.com/Suwayomi/Suwayomi-Server](https://github.com/Suwayomi/Suwayomi-Server)）：桌面漫画服务器（Tachiyomi/Mihon 的重写），内置扩展商店，适合追连载。
 - **Komga**（[komga.org](https://komga.org)）：媒体服务器，扫描你已有的漫画文件，元数据与阅读进度管理更细。
 
+### 友情链接
+
+- 🐧 [**LinuxDO**](https://linux.do) — 技术爱好者社区
+
 ### 许可
 
 **AGPL-3.0**，全文见 [LICENSE](LICENSE)。派生自 KOReader 内置的 `opds.koplugin`（AGPL-3.0）。每个版本的改动见 [Release 说明](https://github.com/hugo1120/opdsforcomic.koplugin/releases)。
@@ -133,6 +137,10 @@ This plugin is the client; you need an OPDS server of your own. Both below are t
 
 - **Suwayomi** ([github.com/Suwayomi/Suwayomi-Server](https://github.com/Suwayomi/Suwayomi-Server)): desktop manga server (a rewrite of Tachiyomi/Mihon) with a built-in extension store, for following ongoing series.
 - **Komga** ([komga.org](https://komga.org)): a media server for comics you already have, with finer metadata and progress control.
+
+### Friend links
+
+- 🐧 [**LinuxDO**](https://linux.do) — A community for tech enthusiasts
 
 ### License
 
