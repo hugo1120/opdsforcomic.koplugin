@@ -208,6 +208,20 @@ local DUAL_COVER_KEY = "opdsforcomic_dual_cover"
 --- an automatic value be dropped on entry while a by-hand choice carries over.
 local DUAL_AUTO_KEY = "opdsforcomic_dual_auto"
 
+--- Left-handed hold: the whole screen flipped upside down (180°).
+---
+--- The reader flips the *device*, not the page, and that is what makes this
+--- free. KOReader's input layer answers a 180° screen rotation by swapping the
+--- physical page-turn keys (input.lua: the DEVICE_ROTATED_UPSIDE_DOWN row of
+--- rotation_map turns LPgFwd into LPgBack, RPgFwd into RPgBack, Up into Down),
+--- so flipping the screen flips the buttons too -- exactly what a left-hand
+--- grip needs, with nothing for this file to remap by hand. A by-hand toggle
+--- while reading applies immediately; the setting is recalled when a chapter
+--- opens, and the rotation is put back when the viewer closes, so the file
+--- manager does not come up upside down.
+local INVERT_KEY = "opdsforcomic_invert180"
+local INVERT_180 = 2 -- rotation modes advance in 90° steps; +2 is upside down.
+
 --- Cutting a two-page scan into the two pages it holds.
 ---
 --- Some releases store a spread as one landscape image. Read as it comes it is
@@ -1054,6 +1068,58 @@ darkenBuffer = function(bb, gamma_value)
     return bb
 end
 
+--- Page turns that come from outside the viewer.
+---
+--- Nothing is more central to a reader than "turn the page", and for the
+--- wrong reasons it is the first thing to break here. KOReader drives remote
+--- controls and a reader's physical keys with the same GotoViewRel event
+--- (readerpaging.lua:111 maps page-forward to onGotoViewRel(1)), delivered
+--- through UIManager:sendEvent to the topmost widget. The ImageViewer this
+--- plugin shows has no onGotoViewRel, so a remote /koreader/event/GotoViewRel/1
+--- fell through to nothing and never turned the page.
+---
+--- The event's unit is "one view", which here is one display slot: what
+--- switchToImageNum counts. Under the split that is a half, under dual-page a
+--- spread -- the same thing a touch tap flips to, so the arithmetic is just
+--- cur + diff, clamped to the list.
+local function bindExternalPageTurns(viewer)
+    viewer.onGotoViewRel = function(self, diff)
+        local cur = self._images_list_cur or 1
+        local nb = self._images_list_nb or 1
+        local target = math.max(1, math.min(nb, cur + (diff or 0)))
+        -- switchToImageNum's first line is a no-op guard against the *same*
+        -- number, so a target that actually moved needs no help; a target that
+        -- did not move is exactly the case the guard exists for.
+        if target ~= cur then
+            self:switchToImageNum(target)
+        end
+    end
+    -- The absolute form, used by some remote controls. Also in slots, for the
+    -- same reason as above.
+    viewer.onGotoView = function(self, view)
+        local nb = self._images_list_nb or 1
+        local target = math.max(1, math.min(nb, view or 1))
+        self:switchToImageNum(target)
+    end
+
+    -- Physical keys. ImageViewer binds PgFwd/PgBack itself, but only when
+    -- Device:hasKeys() and only when self.image is a table, and a device's key
+    -- map can name the groups differently -- on this device the two turn out
+    -- to be RPgBack/RPgFwd (kobo device.lua:833). Binding here makes the
+    -- mapping unconditional and explicit; the events land on ImageViewer's own
+    -- onShowNextImage/onShowPrevImage, so the handlers need no code of ours.
+    -- Merged, never replacing: Close must survive, and a binding the widget
+    -- already made is not worth the churn of remaking.
+    local groups = require("device").input.group
+    viewer.key_events = viewer.key_events or {}
+    if not viewer.key_events.ShowNextImage then
+        viewer.key_events.ShowNextImage = { { groups.PgFwd } }
+    end
+    if not viewer.key_events.ShowPrevImage then
+        viewer.key_events.ShowPrevImage = { { groups.PgBack } }
+    end
+end
+
 function OPDSPSE:getLastPage(remote_url, username, password)
     local last_page = 0
 
@@ -1764,12 +1830,27 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
         images_list_nb = slotCount(),
     }
 
+    -- Left-handed hold, applied here and not in the constructor: the flip is a
+    -- screen-global rotation, so it must be taken down with the viewer, and
+    -- the original mode is the only thing that can restore it exactly.
+    -- Remembered before applyDisplayModeChange may re-pair slots below.
+    viewer.orig_rotation_mode = Screen:getRotationMode()
+    if G_reader_settings:isTrue(INVERT_KEY) then
+        Screen:setRotationMode((viewer.orig_rotation_mode + INVERT_180) % 4)
+    end
+
     -- The constructor renders page one and *then* writes the count it was
     -- given, which was counted before that page had been seen. So a split
     -- chapter whose first sheet holds a single page is one out from the start.
     -- Restate it now that page one has been measured; learnSlots keeps it
     -- current from here on, and it only ever learns at a sheet's first slot.
     viewer._images_list_nb = slotCount()
+
+    -- Remote page-turners and physical page-turn keys talk to readers in
+    -- GotoViewRel events. ImageViewer has no such handler, so this viewer was
+    -- deaf to all of them; see bindExternalPageTurns. Bound before the widget
+    -- is shown, so no event can slip through the window in between.
+    bindExternalPageTurns(viewer)
 
     -- Page turns repaint through ImageViewer's own wfm_mode, which is "ui" on
     -- every panel that is not Kaleido (imageviewer.lua:377). On this device
@@ -2050,6 +2131,33 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
                         end,
                     },
                 },
+                {
+                    {
+                        text = L("Upside down (left hand)", "倒置 180°（左手）"),
+                        -- The check is the setting; the rotation follows it.
+                        checked_func = function()
+                            return G_reader_settings:isTrue(INVERT_KEY)
+                        end,
+                        callback = function()
+                            -- Flipping the screen swaps the physical page-turn
+                            -- keys on its own (input.lua's rotation_map), so a
+                            -- left-hand grip gets one action, not two. The
+                            -- current page needs no re-render: the rotation is
+                            -- screen-level and the page buffer is untouched.
+                            -- A 180° turn keeps the same portrait/landscape
+                            -- class (mode bit 0 unchanged), so it is just
+                            -- rotate-and-repaint without a layout pass, exactly
+                            -- as ReaderView:rotate treats its own 180° (it
+                            -- compares bit.band(mode, 1) and takes the no-
+                            -- layout branch, flushing the screen with nil).
+                            G_reader_settings:flipNilOrFalse(INVERT_KEY)
+                            Screen:setRotationMode(
+                                (Screen:getRotationMode() + INVERT_180) % 4)
+                            UIManager:setDirty(nil, "full")
+                            UIManager:setDirty(dialog, "ui")
+                        end,
+                    },
+                },
             },
         }
         UIManager:show(dialog)
@@ -2197,6 +2305,15 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
     viewer.onCloseWidget = function(this, ...)
         closed = true
         UIManager:unschedule(prefetchNext)
+        -- Left-handed hold flips the whole screen; the file manager does not
+        -- want to inherit that, so the rotation the chapter was opened in is
+        -- restored when the viewer goes down. Only if it actually changed: on
+        -- a fresh KOReader the screen is already upright, and setting the
+        -- same mode back is harmless, but skipping the call keeps the log's
+        -- setRotationMode noise out.
+        if Screen:getRotationMode() ~= viewer.orig_rotation_mode then
+            Screen:setRotationMode(viewer.orig_rotation_mode)
+        end
         -- Read before anything is torn down: the slot-to-page mapping goes away
         -- with the viewer, and the number the catalog understands is the source
         -- page, not the slot.
