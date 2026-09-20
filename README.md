@@ -40,6 +40,19 @@ Kobo 墨水屏实机，点图看原图 · on a Kobo, tap an image for the full s
 - **自动去白边**（默认关）。
 - **三种显示方式**：单页 / 双页 / 拆页。拆页把横着的跨页扫描按中线切成两页分别看；转横屏自动开双页。
 - **文件夹快捷方式**：任意文件夹放一个 `.opdscomic` 空文件，点它直接进 OPDS。
+- **Suwayomi 章节直读**：点章节名直接进阅读器，省掉中间的元数据页和下载对话框——每章少两次点击。
+- **实体翻页键**：支持设备自身的翻页键；配合下面的遥控项目，还可以用手机遥控翻页、旋转和全刷。
+- **续读位置准确**：退出再进来落在你停下的那一页（0.1.1 修）。
+
+### 配套：手机遥控翻页
+
+[**koreader_remote_turnpages**](https://github.com/hugo1120/koreader_remote_turnpages) —— 用手机当 KOReader 的遥控器：
+
+- **翻页**：上一页 / 下一页
+- **旋转**：横竖屏切换（左手倒持看漫画时很顺手）
+- **全刷**：手动消残影。墨水屏攒久了会有鬼影，这是唯一能一键清掉的办法
+
+插件这边不用额外设置；装上遥控端、在同一局域网里连上就行。没有遥控器也不影响任何功能，实体翻页键照常可用。
 
 ### 安装
 
@@ -68,7 +81,7 @@ Kobo 墨水屏实机，点图看原图 · on a Kobo, tap an image for the full s
 
 **拆页**：有些资源把跨页存成一张横图，打开拆页后按中线切开，两页各占一屏；跳页和页码仍按服务器原始页号。已知短板：扫描时就转了 90° 的单页也是横的，会被切开，遇到只能关掉这个开关。
 
-> 关闭阅读界面后，服务器上的进度可能「跳回」旧位置：缓存命中率高时真实请求很少，服务器没收到新进度，关闭时会补发一次。
+> 关闭阅读界面时，插件会把最新的页码补报给服务器一次，所以下次点开这一章会回到你停下的那一页。缓存命中率高时真实请求很少，这一补报是必要的——否则服务器不知道你读到哪了。
 
 ### 服务端
 
@@ -101,6 +114,19 @@ Read comics straight from an OPDS server (Suwayomi, Komga) without downloading t
 - **Auto margin crop** (off by default).
 - **Three display modes**: single / two pages / split — the split cuts a landscape spread scan back into two pages, and going landscape turns on two-page automatically.
 - **Folder shortcut**: a `.opdscomic` empty file opens the catalog with one tap.
+- **Suwayomi chapters open straight into the reader**: tapping a chapter skips the metadata page and the download dialog — two taps fewer per chapter.
+- **Hardware page keys**, plus phone remote control of page turns, rotation and full refresh via the project below.
+- **Accurate resume**: closing and reopening a chapter lands on the page you stopped at (fixed in 0.1.1).
+
+### Companion: phone remote control
+
+[**koreader_remote_turnpages**](https://github.com/hugo1120/koreader_remote_turnpages) turns a phone into a KOReader remote:
+
+- **Page turns** — previous / next
+- **Rotate** — portrait / landscape, handy when holding the reader upside down
+- **Full refresh** — clears e-ink ghosting on demand; this is the only one-tap way to do it
+
+Nothing to configure on the plugin side: install the remote app and put both on the same network. The plugin works fine without it, and the device's own page keys keep working.
 
 ### Installation
 
@@ -129,7 +155,7 @@ Read comics straight from an OPDS server (Suwayomi, Komga) without downloading t
 
 **Split**: releases that store a spread as one landscape image are cut at the middle, so each page gets its own screen. `Go to` and the page counter keep the server's original page numbers. Known gap: a single page stored a quarter-turn rotated is also landscape and will be cut — turn the switch off for those.
 
-> After closing the reader the server's position may appear to jump back: with a high cache hit rate few real requests reach the server, so the position is reported once on close.
+> Closing the reader reports the latest page to the server once, so reopening that chapter comes back to where you stopped. With a high cache hit rate few real requests reach the server, which is exactly why that one report is needed — otherwise the server has no idea how far you got.
 
 ### Server side
 

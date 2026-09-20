@@ -1852,6 +1852,63 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
     -- is shown, so no event can slip through the window in between.
     bindExternalPageTurns(viewer)
 
+    -- The remote's rotate button, same channel. It answers by *pressing* the
+    -- on-screen Rotate button rather than by aiming at the absolute mode the
+    -- event name suggests: viewer.rotated is per-viewer and a new viewer is
+    -- built per chapter, so the view is always upright at open while the remote
+    -- keeps its own 0/1 state -- an absolute mapping would go quiet on the first
+    -- press after a chapter change, which reads as a broken button. The value
+    -- is logged, not acted on.
+    --
+    -- Written here rather than as a module-level helper, and that is a hard
+    -- constraint, not a style choice: LuaJIT allows 60 upvalues per function and
+    -- this one sits at exactly 60, so referencing one more module-level local
+    -- stops the plugin loading altogether -- "function at line <N> has more
+    -- than 60 upvalues", logged as a WARN, plugin silently gone from every
+    -- menu. A local costs nothing. See NOTES 5h and test_luajit_load.py, which
+    -- compiles this file under a real LuaJIT precisely because the host tests
+    -- run on Lua 5.5 and cannot see the limit at all.
+    local toggleRotation
+    viewer.onSetRotationMode = function(self, mode)
+        log("remote rotate: SetRotationMode/%s -> toggling", tostring(mode))
+        toggleRotation()
+        -- Consumed: declining would let the walk continue down the window
+        -- stack, where FileManager answers this event, so the device would
+        -- rotate on top of the page.
+        return true
+    end
+
+    -- The remote's full-refresh button, same channel. ImageViewer has no
+    -- onFullRefresh either, and the event's one handler in the tree
+    -- (DeviceListener:onFullRefresh) cannot be reached from here: sendEvent
+    -- offers the event to the topmost widget, then to *active* widgets only --
+    -- and the rest of the stack is skipped unless a widget is flagged
+    -- is_always_active, which neither FileManager nor this browser is
+    -- (filemanager.lua:414 registers DeviceListener without `always_active`).
+    -- So the event went nowhere and the button did nothing in the reader.
+    --
+    -- The body is the long-press on the page image, copied rather than
+    -- reimplemented (imageviewer.lua:637): that gesture is the reference for
+    -- what "full refresh" means here, it is the only way to clear ghosting in
+    -- this reader, and it is what the user pointed at. It matters because
+    -- full_refresh_count is 0 on this device, so nothing promotes a partial
+    -- refresh to a flashing one by itself.
+    --
+    -- `self.dithered` looks like global state and is not: it lives on the
+    -- viewer, and streamPages builds a viewer per chapter, so it dies with the
+    -- chapter it was set in. On this panel it is close to inert anyway --
+    -- hardware dithering is gated on Kaleido plus colour
+    -- (ffi/framebuffer_mxcfb.lua:370), so all it changes here is an 8-pixel
+    -- rectangle alignment constraint.
+    viewer.onFullRefresh = function(self)
+        log("remote refresh: FullRefresh -> flashing")
+        self.dithered = true
+        UIManager:setDirty(nil, "full", nil, true)
+        -- Consumed like the rotate handler. DeviceListener does the same two
+        -- things minus the log, so declining would refresh twice.
+        return true
+    end
+
     -- Page turns repaint through ImageViewer's own wfm_mode, which is "ui" on
     -- every panel that is not Kaleido (imageviewer.lua:377). On this device
     -- waveform_ui and waveform_partial are the same waveform mode (AUTO, 257),
@@ -1986,10 +2043,15 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
     --- while the split is on -- gluing two spreads together would put four
     --- pages on one screen -- so the branch below is skipped there.
     ---
-    --- Defined after currentSourcePage/applyDisplayModeChange on purpose: a
-    --- local declared further down is not yet in scope here, and the calls
-    --- would quietly go to nil globals.
-    local function toggleRotation()
+    --- Kept this far down on purpose: the locals it reads
+    --- (currentSourcePage/applyDisplayModeChange and friends) are declared
+    --- above, and a local declared further down is not yet in scope, so the
+    --- calls would quietly go to nil globals. `toggleRotation = function()`
+    --- rather than `local function` because the remote-rotate handler bound
+    --- near the top of this function captured this local as an upvalue, and a
+    --- second declaration here would create a different variable and leave
+    --- that closure calling nil.
+    toggleRotation = function()
         -- Read the position first: the source page is the only thing that
         -- survives the flip, since everything else about a slot's meaning
         -- depends on the rotation being flipped.
@@ -2498,10 +2560,17 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
     if continue then
         self:jumpToPage(viewer, count, currentSourcePage(), firstSlotOfSource)
     elseif last_page_read then
-        -- last_page_read is a source page from the catalog; the viewer counts
-        -- display slots, which are spreads under dual-page and halves of a
-        -- sheet under the split.
-        viewer:switchToImageNum(firstSlotOfSource(last_page_read))
+        -- last_page_read is the catalog's *zero-based page index*, not a source
+        -- page -- the same numbering the Kavita branch below uses, and the same
+        -- one reportProgress writes: it sends `page - 1`, and the server echoes
+        -- that value straight back as pse:lastRead and as the History feed's
+        -- "Progress: N of M" (both captured from the real server, and for the
+        -- same chapter they agree: 119 of 327 / pse:lastRead="119"). So it
+        -- needs the same +1, and the lack of it is why every resume used to
+        -- land one page before where the reader stopped. At the front of a
+        -- chapter that is indistinguishable from having no position at all:
+        -- read two pages, close, reopen, and page one comes back.
+        viewer:switchToImageNum(firstSlotOfSource(last_page_read + 1))
     else
         -- add 1 since Kavita's Page count is zero based
         -- and ImageViewer is not.
@@ -2513,6 +2582,14 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
     -- and closed -- and never moves the catalog's position backwards because of
     -- the latter. See reportProgress.
     initial_source = currentSourcePage()
+    -- The pair, not the conversion: the index as the catalog stored it and the
+    -- source page the reader actually landed on. Logging both keeps the
+    -- off-by-one auditable from the log alone -- `resume index 20` next to
+    -- `landed on source page 21` -- without restating the `+ 1` above in a
+    -- second place. Two copies of a conversion is what let the two sides drift
+    -- apart in the first place.
+    log("resume: catalog index %s, landed on source page %d",
+        tostring(last_page_read), initial_source)
 
     -- Trim the disk cache once the viewer is up, so opening a chapter never
     -- waits on a directory walk.

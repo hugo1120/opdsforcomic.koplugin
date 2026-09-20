@@ -1305,6 +1305,15 @@ function OPDSBrowser:onMenuSelect(item)
         logger.dbg("Downloads available:", item)
         self:showDownloads(item)
     else -- catalog or Search item
+        -- Suwayomi fast path: a chapter entry points at a one-item metadata
+        -- feed. Open the reader directly instead of showing that page plus
+        -- the download dialog (two extra taps per chapter). The URL shape
+        -- (/api/opds/v1.2/series/N/chapter/M/metadata) is Suwayomi-specific,
+        -- so no server switch is involved: no other OPDS server produces
+        -- links under the /api/opds/v1.2/ prefix.
+        if self.isSuwayomiChapterEntry(item) then
+            return self:openSuwayomiChapter(item)
+        end
         if #self.paths == 0 then -- root list
             if item.idx == 1 then
                 if #self.downloads > 0 then
@@ -1331,6 +1340,86 @@ function OPDSBrowser:onMenuSelect(item)
         NetworkMgr:runWhenConnected(connect_callback)
     end
     return true
+end
+
+-- Suwayomi fast path: a chapter entry points at a one-item metadata feed
+-- whose only acquisition is the page stream. Fetch it, extract the stream,
+-- and open the reader directly, skipping the two extra taps (metadata page,
+-- download dialog) the generic path would cost.
+--
+-- The chapter's stream URL carries {pageNumber} as a literal placeholder and
+-- the server records progress server-side (updateProgress=true).
+
+-- Chapter-level entry? Only Suwayomi produces links under the
+-- /api/opds/v1.2/series/N/chapter/M/metadata shape, so this doubles as the
+-- server gate: Komga and the standard OPDS servers never match.
+function OPDSBrowser.isSuwayomiChapterEntry(item)
+    return type(item) == "table"
+        and item.url
+        and item.url:match("/api/opds/v1%.2/series/%d+/chapter/%d+/metadata") and true or false
+end
+
+function OPDSBrowser:openSuwayomiChapter(item)
+    local ok, catalog = pcall(self.parseFeed, self, item.url)
+    if not ok or not catalog then
+        logger.info("Suwayomi chapter: metadata feed failed, falling back to %s", item.url)
+        self.catalog_title = item.text or self.catalog_title
+        self:updateCatalog(item.url)
+        return true
+    end
+    local menu_table = self:genItemTableFromCatalog(catalog, item.url)
+    local entry = menu_table and menu_table[1]
+    local acq = entry and entry.acquisitions and entry.acquisitions[1]
+    if acq and acq.count then
+        -- Where to resume. The metadata feed's stream link carries
+        -- pse:lastRead, which genItemTableFromCatalog() already turned into
+        -- acq.last_read; that is the authoritative source and the server emits
+        -- it *only* when there is progress ("Progress: 0" chapters carry
+        -- pse:lastReadDate but no pse:lastRead, so it is absent, not zero).
+        -- The History feed's "Progress: N of M" text is the fallback for a feed
+        -- whose stream link drops the attribute. It cannot serve as the primary
+        -- source because the chapter listing has no such text -- reading it
+        -- first would make a chapter-list tap always start at page one.
+        local source = "page one"
+        local last_page_read = acq.last_read
+        if last_page_read then
+            source = "pse:lastRead"
+        else
+            last_page_read = self.suwayomiProgressFromItem(item)
+            if last_page_read then source = "history summary" end
+        end
+        -- "index", not "page": this is the catalog's zero-based value and
+        -- streamPages adds one before jumping (and reportProgress subtracts one
+        -- when writing it back). Labelling it a page invites reading
+        -- `resume=20` next to `reported page 21` as an off-by-one bug, which is
+        -- how this exact value was misread once already.
+        logger.info("Suwayomi chapter: streaming %d pages, resume index=%s (from %s)",
+            acq.count, tostring(last_page_read or 0), source)
+        OPDSPSE:streamPages(acq.href, acq.count, false,
+            self.root_catalog_username, self.root_catalog_password, last_page_read)
+    else
+        -- Feed shape changed; show it as a subcatalog rather than failing.
+        self.catalog_title = item.text or self.catalog_title
+        self:updateCatalog(item.url)
+    end
+    return true
+end
+
+-- Fallback resume source: the History feed annotates each entry with
+-- "Progress: N of M" in its <summary>, which the parser hands over as
+-- item.content. Returns N, or nil when there is none -- the chapter listing
+-- carries no such text, and "Progress: 0" means unread, so both are page one.
+-- The number is the server's own progress semantics and is passed through
+-- unchanged, exactly as the generic path passes acquisition.last_read.
+function OPDSBrowser.suwayomiProgressFromItem(item)
+    if type(item) ~= "table" then return nil end
+    local content = type(item.content) == "string" and item.content or nil
+    if not content then return nil end
+    local progress = content:match("Progress:%s*(%d+)")
+    if not progress then return nil end
+    local n = tonumber(progress)
+    if n and n > 0 then return n end
+    return nil
 end
 
 -- Menu action on item long-press (dialog Edit / Delete catalog)
