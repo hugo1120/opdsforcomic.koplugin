@@ -41,6 +41,7 @@ Kobo 墨水屏实机，点图看原图 · on a Kobo, tap an image for the full s
 - **三种显示方式**：单页 / 双页 / 拆页。拆页把横着的跨页扫描按中线切成两页分别看；转横屏自动开双页。
 - **文件夹快捷方式**：任意文件夹放一个 `.opdscomic` 空文件，点它直接进 OPDS。
 - **Suwayomi 章节直读**：点章节名直接进阅读器，省掉中间的元数据页和下载对话框——每章少两次点击。
+- **章节导航**：读到章末再往后翻，直接问你要不要开下一章，**章节名一并列出**；底部工具栏长按「跳页」看前后各 5 章。
 - **实体翻页键**：支持设备自身的翻页键；配合下面的遥控项目，还可以用手机遥控翻页、旋转和全刷。
 - **续读位置准确**：退出再进来落在你停下的那一页（0.1.1 修）。
 
@@ -83,6 +84,45 @@ Kobo 墨水屏实机，点图看原图 · on a Kobo, tap an image for the full s
 
 > 关闭阅读界面时，插件会把最新的页码补报给服务器一次，所以下次点开这一章会回到你停下的那一页。缓存命中率高时真实请求很少，这一补报是必要的——否则服务器不知道你读到哪了。
 
+### 章节导航
+
+读到一章的**最后一页再往后翻**，插件会问你要不要继续；**第 1 页往回翻**也会问（同一章 3 秒内只弹一次）。**章节名一并列出**，哪个是「下一章」标在名字前面：
+
+```
+┌───────────────────────────────────────────┐
+│                 本章结束                  │
+├───────────────────────────────────────────┤
+│ 下一章 · ⭕  20 - 刃牙 Vol.20 (668.5 MiB) │
+│ 上一章 · ⭕  18 - 刃牙 Vol.18 (652.2 MiB) │
+├─────────────────────┬─────────────────────┤
+│      更多章节…      │        取消         │
+└─────────────────────┴─────────────────────┘
+```
+
+**长按「跳页」**，是前后各 5 章的单列列表，按章节列表本来的顺序排，当前这一章标成「正在阅读」：
+
+```
+┌─────────────────────────────────────────────┐
+│                    章节                     │
+├─────────────────────────────────────────────┤
+│ ⭕  24 - 刃牙 Vol.24 (656.2 MiB)            │
+│ ⭕  23 - 刃牙 Vol.23 (702 MiB)              │
+│ ⭕  22 - 刃牙 Vol.22 (673.7 MiB)            │
+│ ⭕  21 - 刃牙 Vol.21 (676.6 MiB)            │
+│ ⭕  20 - 刃牙 Vol.20 (668.5 MiB)            │
+│ 正在阅读 · ⭕  19 - 刃牙 Vol.19 (699.2 MiB) │
+│ ⭕  18 - 刃牙 Vol.18 (652.2 MiB)            │
+│ ⭕  17 - 刃牙 Vol.17 (995.6 MiB)            │
+│ ⭕  16 - 刃牙 Vol.16 (1 GiB)                │
+│ ⭕  15 - 刃牙 Vol.15 (1,000.7 MiB)          │
+│ ⭕  14 - 刃牙 Vol.14 (953.8 MiB)            │
+├──────────────────────┬──────────────────────┤
+│     返回章节列表     │         取消         │
+└──────────────────────┴──────────────────────┘
+```
+
+点哪一行就开哪一章。**「返回章节列表」**打开的是**这本书**的章节列表——从历史记录点进去的章节也一样，不会把你丢回历史记录。
+
 ### 服务端
 
 本插件是客户端，需要你自己有一个 OPDS 服务器。以下两个都经过实机验证：
@@ -115,6 +155,7 @@ Read comics straight from an OPDS server (Suwayomi, Komga) without downloading t
 - **Three display modes**: single / two pages / split — the split cuts a landscape spread scan back into two pages, and going landscape turns on two-page automatically.
 - **Folder shortcut**: a `.opdscomic` empty file opens the catalog with one tap.
 - **Suwayomi chapters open straight into the reader**: tapping a chapter skips the metadata page and the download dialog — two taps fewer per chapter.
+- **Chapter navigation**: turning past a chapter's last page offers to carry on, **naming the chapter**; long press `Go to` in the toolbar for five chapters either way.
 - **Hardware page keys**, plus phone remote control of page turns, rotation and full refresh via the project below.
 - **Accurate resume**: closing and reopening a chapter lands on the page you stopped at (fixed in 0.1.1).
 
@@ -156,6 +197,45 @@ Nothing to configure on the plugin side: install the remote app and put both on 
 **Split**: releases that store a spread as one landscape image are cut at the middle, so each page gets its own screen. `Go to` and the page counter keep the server's original page numbers. Known gap: a single page stored a quarter-turn rotated is also landscape and will be cut — turn the switch off for those.
 
 > Closing the reader reports the latest page to the server once, so reopening that chapter comes back to where you stopped. With a high cache hit rate few real requests reach the server, which is exactly why that one report is needed — otherwise the server has no idea how far you got.
+
+### Chapter navigation
+
+Turning past the **last page of a chapter** asks whether to carry on; turning back on the **first page** asks as well (once per chapter, every three seconds). The chapters are **named**, with the role in front of the name:
+
+```
+┌─────────────────────────────────────────────────────┐
+│                   End of chapter                    │
+├─────────────────────────────────────────────────────┤
+│ Next chapter · ⭕  20 - 刃牙 Vol.20 (668.5 MiB)     │
+│ Previous chapter · ⭕  18 - 刃牙 Vol.18 (652.2 MiB) │
+├──────────────────────────┬──────────────────────────┤
+│      More chapters…      │          Cancel          │
+└──────────────────────────┴──────────────────────────┘
+```
+
+**Long press `Go to`** for a single column of five chapters either way, in the chapter list's own order, with the current one marked as what you are reading:
+
+```
+┌─────────────────────────────────────────────────┐
+│                    Chapters                     │
+├─────────────────────────────────────────────────┤
+│ ⭕  24 - 刃牙 Vol.24 (656.2 MiB)                │
+│ ⭕  23 - 刃牙 Vol.23 (702 MiB)                  │
+│ ⭕  22 - 刃牙 Vol.22 (673.7 MiB)                │
+│ ⭕  21 - 刃牙 Vol.21 (676.6 MiB)                │
+│ ⭕  20 - 刃牙 Vol.20 (668.5 MiB)                │
+│ Reading now · ⭕  19 - 刃牙 Vol.19 (699.2 MiB)  │
+│ ⭕  18 - 刃牙 Vol.18 (652.2 MiB)                │
+│ ⭕  17 - 刃牙 Vol.17 (995.6 MiB)                │
+│ ⭕  16 - 刃牙 Vol.16 (1 GiB)                    │
+│ ⭕  15 - 刃牙 Vol.15 (1,000.7 MiB)              │
+│ ⭕  14 - 刃牙 Vol.14 (953.8 MiB)                │
+├────────────────────────┬────────────────────────┤
+│  Back to chapter list  │         Cancel         │
+└────────────────────────┴────────────────────────┘
+```
+
+Tapping a row opens that chapter. **`Back to chapter list`** opens *this book's* chapter list — including for a chapter opened from History, which would otherwise land you back on History.
 
 ### Server side
 

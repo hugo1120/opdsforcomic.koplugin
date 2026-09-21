@@ -1082,7 +1082,16 @@ end
 --- switchToImageNum counts. Under the split that is a half, under dual-page a
 --- spread -- the same thing a touch tap flips to, so the arithmetic is just
 --- cur + diff, clamped to the list.
-local function bindExternalPageTurns(viewer)
+---
+--- `on_boundary` is optional and is called with the direction of a turn that
+--- could not move -- forward off the last slot, back off the first. That turn is
+--- the only place in KOReader where "this chapter is finished" can be observed
+--- at all: ImageViewer clamps and returns without saying anything
+--- (imageviewer.lua:495), and its two handlers are what the touch taps and the
+--- physical keys arrive on, so intercepting here is what covers all three ways
+--- of asking for a turn. Without it the behaviour is exactly what it was -- a
+--- no-op at the ends of the list.
+local function bindExternalPageTurns(viewer, on_boundary)
     viewer.onGotoViewRel = function(self, diff)
         local cur = self._images_list_cur or 1
         local nb = self._images_list_nb or 1
@@ -1092,6 +1101,12 @@ local function bindExternalPageTurns(viewer)
         -- did not move is exactly the case the guard exists for.
         if target ~= cur then
             self:switchToImageNum(target)
+        elseif on_boundary and (diff or 0) ~= 0 and on_boundary((diff or 0) > 0) then
+            -- Consumed only when the offer was actually made. A direction of
+            -- zero is not a turn and is left alone, and an unhandled boundary
+            -- still returns nothing, so this event walks the stack exactly as
+            -- far as it did before.
+            return true
         end
     end
     -- The absolute form, used by some remote controls. Also in slots, for the
@@ -1102,12 +1117,43 @@ local function bindExternalPageTurns(viewer)
         self:switchToImageNum(target)
     end
 
+    -- Touch taps and physical keys, wrapped for the same reason as the relative
+    -- event above: these two are where a tap on the left or right third of the
+    -- screen lands (imageviewer.lua:534-536) and where the page-turn keys land
+    -- through the key_events bound below, and each of them is also the place
+    -- where a turn off the end of the list is swallowed without a word. Only
+    -- that case is intercepted; every other turn is handed to the original
+    -- method untouched, so ordinary paging is not on this path at all.
+    --
+    -- Captured rather than reached for through the metatable at call time: the
+    -- assignment below shadows the class method on this instance, and an
+    -- instance that later grew a second override should compose with this one
+    -- instead of replacing what it found.
+    if on_boundary then
+        local orig_on_show_next = viewer.onShowNextImage
+        local orig_on_show_prev = viewer.onShowPrevImage
+        viewer.onShowNextImage = function(this, ...)
+            if (this._images_list_cur or 1) >= (this._images_list_nb or 1) and on_boundary(true) then
+                return true
+            end
+            return orig_on_show_next(this, ...)
+        end
+        viewer.onShowPrevImage = function(this, ...)
+            if (this._images_list_cur or 1) <= 1 and on_boundary(false) then
+                return true
+            end
+            return orig_on_show_prev(this, ...)
+        end
+    end
+
     -- Physical keys. ImageViewer binds PgFwd/PgBack itself, but only when
     -- Device:hasKeys() and only when self.image is a table, and a device's key
     -- map can name the groups differently -- on this device the two turn out
     -- to be RPgBack/RPgFwd (kobo device.lua:833). Binding here makes the
-    -- mapping unconditional and explicit; the events land on ImageViewer's own
-    -- onShowNextImage/onShowPrevImage, so the handlers need no code of ours.
+    -- mapping unconditional and explicit; the events land on
+    -- onShowNextImage/onShowPrevImage, which by now is either the wrapper bound
+    -- above or ImageViewer's own -- either way the handlers need no code of
+    -- ours, and either way a key turns the page exactly as a tap does.
     -- Merged, never replacing: Close must survive, and a binding the widget
     -- already made is not worth the churn of remaking.
     local groups = require("device").input.group
@@ -1206,7 +1252,12 @@ function OPDSPSE:getLastPage(remote_url, username, password)
     return last_page;
 end
 
-function OPDSPSE:streamPages(remote_url, count, continue, username, password, last_page_read)
+--- `chapter_nav` is the chapter's neighbours in the list it was opened from, as
+--- built by OPDSBrowser:suwayomiChapterNav, or nil for every caller that has no
+--- chapter list to speak of -- a single cover, a plain download. Nil is the
+--- whole switch: with it the reader behaves exactly as it did before, including
+--- doing nothing at all at the ends of the list.
+function OPDSPSE:streamPages(remote_url, count, continue, username, password, last_page_read, chapter_nav)
     -- attempt to pull chapter progress from Kavita if user pressed
     -- "Page Stream" button.
     -- We have to pull the progress here, otherwise the creation of the page_table
@@ -1846,11 +1897,28 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
     -- current from here on, and it only ever learns at a sheet's first slot.
     viewer._images_list_nb = slotCount()
 
+    -- A turn that could not move: the reader has run off the end of the chapter
+    -- and is asking for more. That is the only form this moment takes -- see
+    -- bindExternalPageTurns -- so this closure is what stands in for the
+    -- "chapter finished" event KOReader does not have.
+    --
+    -- Kept as a local, and deliberately touching nothing but what is already in
+    -- scope above it: this function sits at exactly 60 upvalues, the LuaJIT
+    -- ceiling, and naming one more module-level local from in here would stop
+    -- the plugin loading. The dialog itself lives in a method on OPDSPSE for the
+    -- same reason -- a method call through `self` costs this function nothing,
+    -- and the method gets a budget of its own for the widget code it needs.
+    local function atChapterEdge(forward)
+        if not chapter_nav then return false end
+        self:showChapterChooser(viewer, chapter_nav, forward, false, count)
+        return true
+    end
+
     -- Remote page-turners and physical page-turn keys talk to readers in
     -- GotoViewRel events. ImageViewer has no such handler, so this viewer was
     -- deaf to all of them; see bindExternalPageTurns. Bound before the widget
     -- is shown, so no event can slip through the window in between.
-    bindExternalPageTurns(viewer)
+    bindExternalPageTurns(viewer, atChapterEdge)
 
     -- The remote's rotate button, same channel. It answers by *pressing* the
     -- on-screen Rotate button rather than by aiming at the absolute mode the
@@ -2405,6 +2473,19 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
     local CenterContainer = require("ui/widget/container/centercontainer")
     local Geom = require("ui/geometry")
 
+    -- Long press on the page-jump key is the way to the chapters further away.
+    -- A tap only ever reaches the single neighbour the boundary offer puts on
+    -- screen, and there has to be some way to step two or three chapters
+    -- without leaving the reader for the list. Left nil when the chapter was
+    -- not opened from a list (a cover, a plain download): the chooser would
+    -- have nothing to offer there, and an inert key beats an empty dialog.
+    local hold_goto
+    if chapter_nav then
+        hold_goto = function()
+            self:showChapterChooser(viewer, chapter_nav, true, true, count)
+        end
+    end
+
     viewer.button_table = ButtonTable:new{
         width = viewer.width - 2 * viewer.button_padding,
         buttons = {
@@ -2441,6 +2522,7 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
                     callback = function()
                         OPDSPSE:jumpToPage(viewer, count, currentSourcePage(), firstSlotOfSource)
                     end,
+                    hold_callback = hold_goto,
                 },
                 {
                     id = "crop",
@@ -2649,6 +2731,272 @@ function OPDSPSE:jumpToPage(viewer, count, current_source, to_slot)
     }
     UIManager:show(input_dialog)
     input_dialog:onShowKeyboard()
+end
+
+--- The chapter number a title starts with, or nil.
+---
+--- Tolerant of a prefix, because Suwayomi puts a read/unread marker in front of
+--- the name ("⌛  11 - 刃牙 Vol.11"). Anchored on the dash that follows the
+--- number, and the anchor is the whole point: without it a series name carrying
+--- a volume range would parse as a chapter number. The History feed's titles are
+--- "⌛  [板垣恵介][刃牙 完全版][Vol.01-Vol.24][完结][bili]: 10 - …", where the
+--- first digits in the string are the "01" of "Vol.01".
+local function chapterNumberIn(title)
+    if type(title) ~= "string" then return nil end
+    local digits = title:match("^[^%d]*(%d+)%s*%-")
+    return digits and tonumber(digits) or nil
+end
+
+--- Whether the chapter named by `other_title` comes before the one named by
+--- `here_title`. Returns nil when the titles do not say.
+---
+--- Asked one neighbour at a time, so the answer does not depend on which way the
+--- list runs -- a Suwayomi feed may hand its chapters over newest first, and then
+--- the entry before this one in the list is the *later* chapter, which is the
+--- reader's "前一张并不是上一张". Comparing each neighbour with the chapter in
+--- between also still works at the ends of a series, where only one neighbour
+--- exists to ask.
+---
+--- Equal numbers return nil on purpose. A title that carries digits which are
+--- not its chapter number -- the History feed's "[Vol.01-Vol.24][完结][bili]: 10
+--- - …" parses as 1 on every row of that series -- would answer "earlier" for
+--- both neighbours at once. Refusing to answer leaves the caller on list order,
+--- which is at least the order the reader saw.
+local function isEarlierChapter(here_title, other_title)
+    local here, other = chapterNumberIn(here_title), chapterNumberIn(other_title)
+    if not here or not other or here == other then return nil end
+    return other < here
+end
+
+--- Offers the chapters next to the one on screen.
+---
+--- `wide` is the long press on the page-jump button: the chapters on either side
+--- of the current one, in list order, with the current one marked. List order on
+--- purpose -- it is the order of the chapter list the reader picked this one
+--- from, so it is the order they already recognise, and they scan it the same
+--- way they scanned that list.
+---
+--- The narrow shape is a turn that could not move, and it offers just the two
+--- neighbours, ordered by the direction of the turn: ask to go forward and the
+--- forward chapter is listed first. Which of the two is the earlier chapter is
+--- decided by their own numbers where they say -- see isEarlierChapter -- rather
+--- than by list position, because that is exactly the case this dialog exists
+--- for.
+---
+--- `total` is logged rather than shown. It is what lets a device log tell this
+--- dialog apart from an offer made at another boundary.
+function OPDSPSE:showChapterChooser(viewer, nav, forward, wide, total)
+    -- No nav means the chapter was not opened from a list -- a single cover, a
+    -- plain download -- and there is nothing to offer. Checked here as well as
+    -- in the boundary callback so that neither of them has to be the only thing
+    -- standing between a nil and an index into it.
+    if not nav then return end
+    local chapters, index = nav.chapters, nav.index
+    if type(chapters) ~= "table" or not index then return end
+
+    local function nameOf(entry)
+        local text = entry and (entry.title or entry.text)
+        return type(text) == "string" and text or "?"
+    end
+
+    -- Walks the chapter list outwards from where the reader is. Counts chapters
+    -- and not entries: navigation rows a feed may have interleaved with its
+    -- chapters are filtered out before the list gets here.
+    local function nearby(dir, want)
+        local found, i = {}, index + dir
+        while #found < want and i >= 1 and i <= #chapters do
+            table.insert(found, chapters[i])
+            i = i + dir
+        end
+        return found
+    end
+
+    local span = wide and 5 or 1
+    local before, after = nearby(-1, span), nearby(1, span)
+    local back, on_ward = before[1], after[1]
+
+    if not back and not on_ward then
+        UIManager:show(InfoMessage:new{
+            text = L("No other chapters in this list.", "这个列表里没有其它章节。"),
+        })
+        return
+    end
+
+    if not wide then
+        -- A short window, on the two sides reachable by accident or by asking
+        -- for something that is not there. Back off the first page is one turn
+        -- away from ordinary reading, and a reader working backwards through a
+        -- chapter arrives at it with the finger still moving. The same window
+        -- covers "there is nothing that way", or the last chapter of a series
+        -- would re-open a dialog whose only real answer is Cancel on every turn.
+        local nothing_that_way = forward and not on_ward or (not forward and not back)
+        if not forward or nothing_that_way then
+            local now = os.time()
+            if nav.offered_at and now - nav.offered_at < 3 then return end
+            nav.offered_at = now
+        end
+    end
+
+    local ButtonDialog = require("ui/widget/buttondialog")
+    local dialog
+
+    --- Opens `entry` in place of the chapter on screen.
+    ---
+    --- The viewer goes down first, and it has to: its onCloseWidget is what
+    --- reports the position back to the catalog and lets go of the cache, the
+    --- crop boxes and the stash, and it is bound to the viewer being replaced.
+    --- Leaving it open would strand that work on a widget nothing will ever close
+    --- again. The report it schedules cannot land on the wrong chapter either --
+    --- reportProgress closes over the stream URL of the chapter it was built for.
+    local function goTo(entry)
+        UIManager:close(dialog)
+        viewer:onClose()
+        nav.open(entry)
+    end
+
+    --- Closes without changing the chapter.
+    ---
+    --- The repaint is not cosmetic. The dialog covered the page, this device runs
+    --- with full_refresh_count = 0 and the viewer has no title bar, so nothing
+    --- else would ever repaint that area and the reader would go on reading
+    --- through the shape of the dialog they just dismissed. "ui" is the mode a
+    --- page turn uses here, so it costs what turning a page costs and asks for no
+    --- flash the reader has not asked for -- a long press is still the way to a
+    --- real clean.
+    local function dismiss()
+        UIManager:close(dialog)
+        UIManager:setDirty(viewer, "ui")
+    end
+
+    local function chapterRow(entry)
+        return {
+            -- Long names are the norm here ("186 - [天王寺大×郷力也][ミナミの帝王
+            -- 南之帝王][hugo2233机翻]_Vol.186_tinypic"), and the name is the
+            -- entire point of the row, so truncating it would defeat the dialog.
+            -- This lets Button shrink the font and fall back to two wrapped lines
+            -- instead of cutting the name off.
+            avoid_text_truncation = true,
+            text = nameOf(entry),
+            callback = function() goTo(entry) end,
+        }
+    end
+
+    local rows = {}
+
+    if not wide then
+        -- Direction first. The two entries are ordered by the turn the reader
+        -- made; which of them is the *earlier* chapter is asked of their own
+        -- numbers, and list position is the fallback where the titles are silent
+        -- -- including at the ends of a series, where there is only one.
+        local here = nameOf(chapters[index])
+        local back_is_earlier = isEarlierChapter(here, nameOf(back))
+        if back_is_earlier == nil then
+            -- Nothing readable on that side. The other neighbour's answer is
+            -- about itself, so it settles this one by being its opposite: if the
+            -- only neighbour on offer is the earlier chapter, the missing one
+            -- would have been the later. Where neither can be read -- or there is
+            -- no other neighbour either -- list order is the only guess left.
+            --
+            -- Written out rather than as `x and false or true`, which reads like
+            -- "the opposite of x" and is not: it collapses to `true` whatever x
+            -- is, because `true and false` is false and `nil and false` is nil,
+            -- and both fall through to the `or true`. That dead branch is exactly
+            -- the case at the end of a list running newest-first.
+            local next_is_earlier = isEarlierChapter(here, nameOf(on_ward))
+            if next_is_earlier ~= nil then
+                back_is_earlier = not next_is_earlier
+            else
+                back_is_earlier = true
+            end
+        end
+        local earlier, later = back, on_ward
+        if not back_is_earlier then
+            earlier, later = on_ward, back
+        end
+        -- The label travels with the chapter's role, not with its position in
+        -- this dialog. At the first chapter of a series the only neighbour is
+        -- the *next* one, and a label taken from the row's slot would call it
+        -- "上一章" -- offering the reader the wrong chapter under a name they
+        -- have no reason to doubt.
+        local ordered
+        if forward then
+            ordered = { { later, L("Next chapter", "下一章") }, { earlier, L("Previous chapter", "上一章") } }
+        else
+            ordered = { { earlier, L("Previous chapter", "上一章") }, { later, L("Next chapter", "下一章") } }
+        end
+        for _, pair in ipairs(ordered) do
+            -- Always two pairs, but the entry inside one of them is nil at the
+            -- first and last chapters of a series. That side is skipped rather
+            -- than offered as a row with no chapter behind it -- and the row
+            -- would be tappable, since only the anchor is disabled.
+            if pair[1] then
+                local row = chapterRow(pair[1])
+                -- One line, not two, because Button's label is a single-line
+                -- TextWidget: a newline in `text` does not break the line, it
+                -- just puts an unmatched glyph in it.
+                row.text = pair[2] .. " · " .. row.text
+                table.insert(rows, { row })
+            end
+        end
+        table.insert(rows, {
+            {
+                text = L("More chapters…", "更多章节…"),
+                callback = function()
+                    UIManager:close(dialog)
+                    self:showChapterChooser(viewer, nav, forward, true, total)
+                end,
+            },
+            { text = _("Cancel"), callback = dismiss },
+        })
+    else
+        for i = #before, 1, -1 do
+            table.insert(rows, { chapterRow(before[i]) })
+        end
+        table.insert(rows, { {
+            -- The anchor the rest of the list is read around. Not tappable:
+            -- re-opening the chapter already on screen would close the viewer and
+            -- re-fetch what is decoded in front of the reader.
+            text = L("Reading now", "正在阅读") .. " · " .. nameOf(chapters[index]),
+            avoid_text_truncation = true,
+            enabled = false,
+        } })
+        for _, entry in ipairs(after) do
+            table.insert(rows, { chapterRow(entry) })
+        end
+        table.insert(rows, {
+            {
+                text = L("Back to chapter list", "返回章节列表"),
+                callback = function()
+                    UIManager:close(dialog)
+                    -- The chapter list is the browser under the reader, so
+                    -- closing the viewer is the way back -- but only when the
+                    -- browser is already showing that list, which is the case
+                    -- this button was written for: a chapter tapped in the
+                    -- series' own chapter list. A chapter tapped in History
+                    -- leaves the browser on History, a list of other books,
+                    -- and the button promises the chapters. So the list is
+                    -- opened first, while the reader still covers the screen:
+                    -- the fetch it costs is blocking, and behind the reader is
+                    -- the one place nobody sees it. Opening it after the close
+                    -- would put the wrong list on screen first. Left nil when
+                    -- there is nothing to open, and then this is just a close.
+                    if nav.show_list then nav.show_list() end
+                    viewer:onClose()
+                end,
+            },
+            { text = _("Cancel"), callback = dismiss },
+        })
+    end
+
+    dialog = ButtonDialog:new{
+        title = wide and L("Chapters", "章节")
+            or (forward and L("End of chapter", "本章结束") or L("Start of chapter", "本章开头")),
+        title_align = "center",
+        buttons = rows,
+    }
+    log("chapter chooser: %s, %d row(s), %d pages in this one",
+        wide and "wide" or (forward and "forward" or "back"), #rows, total or 0)
+    UIManager:show(dialog)
 end
 
 return OPDSPSE

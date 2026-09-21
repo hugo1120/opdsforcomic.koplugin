@@ -1395,14 +1395,228 @@ function OPDSBrowser:openSuwayomiChapter(item)
         -- how this exact value was misread once already.
         logger.info("Suwayomi chapter: streaming %d pages, resume index=%s (from %s)",
             acq.count, tostring(last_page_read or 0), source)
+        -- Handed to the reader so it can offer the neighbouring chapters without
+        -- coming back here first. Passed as an argument rather than left on the
+        -- module: the reader is opened once per chapter and a value left behind
+        -- would outlive the chapter it describes. See suwayomiChapterNav.
+        local nav = self:suwayomiChapterNav(item)
         OPDSPSE:streamPages(acq.href, acq.count, false,
-            self.root_catalog_username, self.root_catalog_password, last_page_read)
+            self.root_catalog_username, self.root_catalog_password, last_page_read, nav)
     else
         -- Feed shape changed; show it as a subcatalog rather than failing.
         self.catalog_title = item.text or self.catalog_title
         self:updateCatalog(item.url)
     end
     return true
+end
+
+-- What the reader can reach without coming back to the chapter list first.
+--
+-- The list to navigate is the series' own chapter list. Which list that is
+-- depends on where the chapter was tapped, and the difference matters:
+--
+--   * Tapped in the series' chapter list -- the common case, and the cheap
+--     one. It needs no request: Menu hands onMenuSelect the very table stored
+--     in item_table (menu.lua:1322), so at this moment self.item_table *is*
+--     the chapter list the chapter was tapped from, in the server's own order
+--     -- which is also the order the reader just looked at.
+--   * Tapped in History, or in any other feed that lists chapters of several
+--     series. There the neighbours in the list are neighbours in *time*, not
+--     in the series: the entry above may be a chapter of another manga, or the
+--     same series' chapter 3 three weeks later. Offering those as the previous
+--     and next chapter is worse than offering nothing, so the series' chapter
+--     list is fetched instead. See suwayomiSeriesChapters.
+--
+-- Which of the two it is is settled by the feed the list came from, not by a
+-- guess: item_table.hrefs.self is that feed's own <link rel="self">, so
+-- comparing it with the series this chapter belongs to answers it exactly. The
+-- default is deliberately "fetch": a missing hrefs, a feed shape we have not
+-- seen, a server that names things differently all end in one extra request
+-- rather than in labels that are confidently wrong.
+--
+-- The chapter is located by table identity inside one list, and by URL across
+-- two -- the entries of a fetched feed are freshly parsed tables, so identity
+-- cannot match them against the tapped item. (item.idx cannot be used at all:
+-- menu.lua:1085 sets it only on the items it has *displayed*, "index is valid
+-- only for items that have been displayed", so on a list longer than one
+-- screen most entries have idx == nil, and it would name a position that
+-- depends on how far the reader happened to scroll.)
+--
+-- Filtered to chapters here, in the browser, rather than in the reader: the
+-- reader then needs no opinion about URL shapes, and the chapter-URL pattern
+-- stays in the one place it already was. It also drops the navigation rows a
+-- feed may interleave with its chapters -- they carry no stream to open.
+--
+-- Returns nil when the position cannot be established, which leaves the reader
+-- with exactly the read-only behaviour it had before: no chooser, no boundary
+-- offer.
+function OPDSBrowser:suwayomiChapterNav(item)
+    if type(item) ~= "table" or type(item.url) ~= "string" then return nil end
+    -- /api/opds/v1.2/series/943/chapter/11/metadata -> /api/opds/v1.2/series/943
+    local series_base = item.url:match("^(.-)/chapter/%d+/metadata")
+    if not series_base then return nil end
+
+    local list = self.item_table
+    local chapters, index = {}, nil
+    if type(list) == "table" then
+        for _, entry in ipairs(list) do
+            if self.isSuwayomiChapterEntry(entry) then
+                table.insert(chapters, entry)
+                if entry == item then index = #chapters end
+            end
+        end
+    end
+
+    local hrefs = type(list) == "table" and list.hrefs
+    local self_url = type(hrefs) == "table" and hrefs.self or nil
+    local on_screen = self_url ~= nil
+        and self_url:sub(1, #series_base) == series_base
+        and self_url:find("/chapters", #series_base + 1, true) ~= nil
+    -- Whether the list being navigated is the one the browser already has.
+    -- Remembered rather than tested twice, because the same answer decides both
+    -- whether to fetch and whether "back to the chapter list" has anything to
+    -- open.
+    local list_is_on_screen = on_screen and index ~= nil
+
+    local series_url, title = self_url, self.catalog_title
+    if not list_is_on_screen then
+        -- The query string is carried over: this chapter came from the same
+        -- server with the same parameters, so ask for its series the same way.
+        local query = item.url:match("/chapter/%d+/metadata(.*)$") or ""
+        series_url = series_base .. "/chapters" .. query
+        local fetched, at, feed_title = self:suwayomiSeriesChapters(item, series_url)
+        if not fetched then return nil end
+        chapters, index, title = fetched, at, feed_title
+    end
+
+    -- Re-opening a chapter is precisely what a tap on the chapter list does, so
+    -- the reader calls back into the same path rather than keeping a second copy
+    -- of the metadata fetch, the stream extraction and the resume rules.
+    local open = function(entry)
+        return self:openSuwayomiChapter(entry)
+    end
+
+    -- "Back to the chapter list" means closing the reader and nothing else
+    -- exactly when the browser is already showing that list -- the case the
+    -- button was written for, a chapter tapped in the series' own chapter list.
+    -- It is not that case when the chapter was tapped somewhere else, History
+    -- above all: there the browser holds a list of other books, and closing the
+    -- reader lands on it, under a button that says it returns to the chapters.
+    -- The list then has to be *opened* -- and opening it is the browser's own
+    -- business: the item table that goes on screen, the title bar, the facet
+    -- menu and the path the back button returns to are all its own. So the
+    -- reader is handed the action rather than a URL to call updateCatalog with
+    -- itself. Left nil in the case that needs nothing.
+    local show_list
+    if not list_is_on_screen then
+        show_list = function()
+            -- The name of the list the reader is about to see. The browser
+            -- normally takes it from the row that was tapped, and there is no
+            -- row here, so it is the feed's own title -- for a series chapter
+            -- feed, the name of the series. Kept as a fallback for a feed that
+            -- carries none.
+            self.catalog_title = title or self.catalog_title
+            self:updateCatalog(series_url)
+        end
+    end
+
+    return { chapters = chapters, index = index, open = open, show_list = show_list }
+end
+
+-- The chapters of `item`'s series, straight from the server's own chapter feed.
+--
+-- Only for the case where the list on screen cannot be trusted as that feed
+-- (History above all), because it costs requests: the feed itself plus its
+-- parsing. Kept per series for the rest of the session, so stepping through
+-- several chapters of one series pays for it once, and switching chapters with
+-- the chooser open costs nothing.
+--
+-- A series feed is paginated -- 100 chapters a page, with rel="next" -- so the
+-- chapter being read may not be on the first page. The walk follows rel="next"
+-- until it has the chapter in hand, which for a series of a few hundred
+-- chapters is one or two extra requests, and it keeps what it read and where it
+-- stopped, so the next chapter of the same series resumes the walk instead of
+-- repeating it. Past SERIES_PAGE_LIMIT it stops and answers "no navigation":
+-- better than a request per page while the reader waits on a tap.
+--
+-- Silent on failure, unlike genItemTableFromURL: nothing the reader did asked
+-- for this feed, so it must not put an error in front of the page they are
+-- reading. A nil here costs chapter navigation for this chapter and nothing
+-- else -- which is exactly what every chapter had before the feature existed.
+local SERIES_PAGE_LIMIT = 10
+
+function OPDSBrowser:suwayomiSeriesChapters(item, series_url)
+    self.suwayomi_series_cache = self.suwayomi_series_cache or {}
+    local series = self.suwayomi_series_cache[series_url]
+    if not series then
+        series = { chapters = {}, next_url = series_url, pages = 0 }
+        self.suwayomi_series_cache[series_url] = series
+    end
+    while true do
+        -- What is already in hand, before asking for more: this is the common
+        -- case on every visit after the first, because the walk stops as soon
+        -- as it has the chapter and leaves the rest of the series unread.
+        for index, entry in ipairs(series.chapters) do
+            if entry.url == item.url then
+                return series.chapters, index, series.title
+            end
+        end
+        if not series.next_url or series.pages >= SERIES_PAGE_LIMIT then break end
+
+        local url = series.next_url
+        local ok, catalog = pcall(self.parseFeed, self, url)
+        -- A failure ends the walk but keeps what was already read, and leaves
+        -- the page to be asked for again rather than remembered as empty.
+        if not ok or not catalog then
+            logger.info("Suwayomi series: chapter feed failed at %s", url)
+            break
+        end
+        -- The feed's own title, kept for the reader's way back to this list:
+        -- the browser names a list after the row that was tapped, and the list
+        -- opened *from the reader* has no row behind it to be named after. For
+        -- a series chapter feed this is the series. Suwayomi sends a plain-text
+        -- <title> and the parser hands that over as a string; a feed that sends
+        -- something else (or nothing) simply leaves it unset, and the caller
+        -- falls back to the title already on screen.
+        if not series.title then
+            local feed = catalog.feed or catalog
+            local feed_title = feed and feed.title
+            if type(feed_title) == "string" and feed_title ~= "" then
+                series.title = feed_title
+            end
+        end
+        -- genItemTableFromCatalog also writes the browser's own title, facets
+        -- and search URL. The browser is still open underneath the reader and
+        -- has to be handed back exactly as it was left, so those are put back.
+        local title, facets, search = self.catalog_title, self.facet_groups, self.search_url
+        local menu_table = self:genItemTableFromCatalog(catalog, url)
+        self.catalog_title, self.facet_groups, self.search_url = title, facets, search
+        for _, entry in ipairs(menu_table) do
+            if self.isSuwayomiChapterEntry(entry) then
+                table.insert(series.chapters, entry)
+            end
+        end
+        -- The one success line here, and it is deliberate: without it a wrong
+        -- chapter list on the device leaves no trace at all, so "the chooser
+        -- showed two rows again" cannot be told apart from "the fetched list is
+        -- short" by reading the log. This says the fetch happened, how much came
+        -- back and from where. It costs nothing: logger is already an upvalue of
+        -- this function, so the 60-upvalue ceiling is untouched.
+        logger.info("Suwayomi series: fetched %d chapter(s), %d page(s) so far, from %s",
+            #series.chapters, series.pages + 1, url)
+        series.pages = series.pages + 1
+        local hrefs = menu_table.hrefs
+        series.next_url = type(hrefs) == "table" and hrefs.next or nil
+    end
+    -- Not in anything that was read, for one of two different reasons, and the
+    -- log has to tell them apart.
+    if series.next_url then
+        logger.info("Suwayomi series: %s is beyond the %d page(s) read of %s",
+            item.url, series.pages, series_url)
+    else
+        logger.info("Suwayomi series: %s is not in %s", item.url, series_url)
+    end
+    return nil
 end
 
 -- Fallback resume source: the History feed annotates each entry with
