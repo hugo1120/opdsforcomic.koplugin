@@ -36,6 +36,19 @@ local CatalogCache = Cache:new{
     slots = 20,
 }
 
+-- logger.info is not printf. It walks its varargs, tostrings each one and joins
+-- them with a space (frontend/logger.lua:71-90), so a format string handed to it
+-- arrives in the log verbatim with its placeholders intact and the values
+-- trailing after it as extra fields:
+--
+--     Suwayomi series: fetched %d chapter(s), %d page(s) so far, from %s 23 1 http://...
+--
+-- Every logger call in this file that carries a placeholder therefore formats
+-- first. (pse.lua's own log() wrapper has always done this; these calls were the
+-- ones that went around it.) Worth stating here rather than at each site because
+-- a call that looks right and logs something unreadable is invisible until the
+-- day the line is needed.
+
 local OPDSBrowser = Menu:extend{
     opds20_feed          = "application/opds+json, application/atom+xml;profile=opds-catalog, */*",
     catalog_type         = "application/atom%+xml",
@@ -407,10 +420,27 @@ function OPDSBrowser:deleteCatalog(item)
     self._manager.updated = true
 end
 
+--- How long a single feed request may take before it is abandoned, in seconds.
+---
+--- socketutil.LARGE_BLOCK_TIMEOUT is 10, and it is the *whole* budget for a try:
+--- the total timeout set beside it is never enforced here, because the request
+--- below uses a bare ltn12.sink.table rather than socketutil.table_sink, and
+--- only the latter watches the clock (socketutil.lua:97-115). The block timeout
+--- does apply, through http.TIMEOUT, which set_timeout also writes.
+---
+--- Ten seconds is far too long for what is being fetched. These are feeds —
+--- chapter metadata, a series chapter list, the history list — all XML, two
+--- orders of magnitude smaller than a page image, and the reader is sitting in
+--- front of a frozen screen for every one of those seconds. The 2026-09-25 log
+--- paid it in full eight times (11:29-11:30 and 13:44-13:46), each one also
+--- raising a modal "cannot get catalog" that had to be dismissed. Five is still
+--- generous for a few tens of kilobytes and halves the freeze.
+local FEED_BLOCK_TIMEOUT = 5
+
 -- Fetches feed from server
 function OPDSBrowser:fetchFeed(item_url, headers_only)
     local sink = {}
-    socketutil:set_timeout(socketutil.LARGE_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT)
+    socketutil:set_timeout(FEED_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT)
     local request = {
         url      = item_url,
         method   = headers_only and "HEAD" or "GET",
@@ -1362,7 +1392,8 @@ end
 function OPDSBrowser:openSuwayomiChapter(item)
     local ok, catalog = pcall(self.parseFeed, self, item.url)
     if not ok or not catalog then
-        logger.info("Suwayomi chapter: metadata feed failed, falling back to %s", item.url)
+        logger.info(string.format(
+            "Suwayomi chapter: metadata feed failed, falling back to %s", item.url))
         self.catalog_title = item.text or self.catalog_title
         self:updateCatalog(item.url)
         return true
@@ -1393,8 +1424,9 @@ function OPDSBrowser:openSuwayomiChapter(item)
         -- when writing it back). Labelling it a page invites reading
         -- `resume=20` next to `reported page 21` as an off-by-one bug, which is
         -- how this exact value was misread once already.
-        logger.info("Suwayomi chapter: streaming %d pages, resume index=%s (from %s)",
-            acq.count, tostring(last_page_read or 0), source)
+        logger.info(string.format(
+            "Suwayomi chapter: streaming %d pages, resume index=%s (from %s)",
+            acq.count, tostring(last_page_read or 0), source))
         -- Handed to the reader so it can offer the neighbouring chapters without
         -- coming back here first. Passed as an argument rather than left on the
         -- module: the reader is opened once per chapter and a value left behind
@@ -1568,7 +1600,7 @@ function OPDSBrowser:suwayomiSeriesChapters(item, series_url)
         -- A failure ends the walk but keeps what was already read, and leaves
         -- the page to be asked for again rather than remembered as empty.
         if not ok or not catalog then
-            logger.info("Suwayomi series: chapter feed failed at %s", url)
+            logger.info(string.format("Suwayomi series: chapter feed failed at %s", url))
             break
         end
         -- The feed's own title, kept for the reader's way back to this list:
@@ -1602,8 +1634,9 @@ function OPDSBrowser:suwayomiSeriesChapters(item, series_url)
         -- short" by reading the log. This says the fetch happened, how much came
         -- back and from where. It costs nothing: logger is already an upvalue of
         -- this function, so the 60-upvalue ceiling is untouched.
-        logger.info("Suwayomi series: fetched %d chapter(s), %d page(s) so far, from %s",
-            #series.chapters, series.pages + 1, url)
+        logger.info(string.format(
+            "Suwayomi series: fetched %d chapter(s), %d page(s) so far, from %s",
+            #series.chapters, series.pages + 1, url))
         series.pages = series.pages + 1
         local hrefs = menu_table.hrefs
         series.next_url = type(hrefs) == "table" and hrefs.next or nil
@@ -1611,10 +1644,10 @@ function OPDSBrowser:suwayomiSeriesChapters(item, series_url)
     -- Not in anything that was read, for one of two different reasons, and the
     -- log has to tell them apart.
     if series.next_url then
-        logger.info("Suwayomi series: %s is beyond the %d page(s) read of %s",
-            item.url, series.pages, series_url)
+        logger.info(string.format("Suwayomi series: %s is beyond the %d page(s) read of %s",
+            item.url, series.pages, series_url))
     else
-        logger.info("Suwayomi series: %s is not in %s", item.url, series_url)
+        logger.info(string.format("Suwayomi series: %s is not in %s", item.url, series_url))
     end
     return nil
 end

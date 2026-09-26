@@ -75,12 +75,20 @@ local MEM_CACHE_MIN_PAGES = 4
 --- Prefetch timeouts, in seconds. Shorter than the ones used for a
 --- user-initiated page turn, because a prefetch blocks the UI unannounced
 --- while the reader is looking at another page — but not so short that a
---- merely slow page gets killed and fetched twice.
-local PREFETCH_BLOCK_TIMEOUT = 6
+--- merely slow page gets killed and fetched twice. Six was picked against an
+--- older baseline; the 2026-09-25 log puts a *successful* prefetch at p95
+--- 802 ms and 1.76 s at its slowest, and shows 38 of them sitting on the full
+--- six seconds while the server was merely slow. Three still clears the slowest
+--- success by 1.7x, and one killed too early costs a redundant request rather
+--- than a lost page — `needed` still sees an empty cache and re-arms.
+local PREFETCH_BLOCK_TIMEOUT = 3
 local PREFETCH_TOTAL_TIMEOUT = 15
---- Consecutive prefetch failures before the look-ahead chain is left down for
---- PREFETCH_COOLDOWN. Three rather than one: a single timeout usually means the
---- network had a moment, and the attempt after it tends to succeed.
+--- How many prefetch failures *inside one PREFETCH_FAIL_WINDOW* leave the
+--- look-ahead chain down for PREFETCH_COOLDOWN. A window, not a streak: the
+--- failure this break exists for is a link that is intermittently bad, and a
+--- streak count cannot see it — fail, fail, succeed, fail, fail clears the
+--- count on every success and never reaches three. Five such moments in the
+--- 2026-09-25 log (14:15, 14:16, 14:46, 17:25, 19:57) walked straight past it.
 local PREFETCH_FAIL_MAX = 3
 --- How long the chain stays down once that happens, in seconds. Long enough for
 --- a Wi-Fi reassociation to complete, short enough that the reader never has to
@@ -1272,7 +1280,14 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
     -- version of its own, so a device test cannot be told apart from testing
     -- the previous build unless the log says which one ran. Remove together
     -- with the "not a JPEG" diagnostic in renderSlot.
-    log("opening stream: %d pages [perf-fixes 2026-09-16c]", count)
+    --
+    -- The token after the label is the whole point, so it changes whenever the
+    -- build does. 2026-09-16c shipped as 0.1.2 and is what the 2026-09-25 audit
+    -- was taken against; 2026-09-25 is the timeout/breaker/stash round, and the
+    -- prefetch breaker's own line ("N failures in 60 s") is the other place a
+    -- log says which of the two it came from. The label stays "perf-fixes" so
+    -- the tooling that slices on it keeps working.
+    log("opening stream: %d pages [perf-fixes 2026-09-25]", count)
 
     -- Raw image bytes, keyed by 0-based page index (ImageViewer page numbers
     -- are 1-based, so index == key - 1, as elsewhere in this file).
@@ -1302,6 +1317,31 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
     -- re-cut, only re-decoded. Keeping it beside the buffer is what lets an
     -- entry survive a direction that changed and changed back.
     local stash_entries = {}
+    -- The same idea for whole pages -- the path taken whenever the split is
+    -- off, and by every page of a split chapter that is not a spread. Kept in
+    -- its own list rather than folded into stash_entries because the two key
+    -- spaces would collide, not because the two behave differently: a half is
+    -- keyed index * 2 + half, which covers every positive integer, so there is
+    -- no number left over for a whole page to be keyed by. Sharing the list
+    -- would need an offset, and an offset is one more thing to get wrong; a
+    -- second table costs nothing and reads as what it is.
+    --
+    -- This is where the repeat renders go. Re-rendering a page that has already
+    -- been rendered costs a full decode every time -- the memory cache holds the
+    -- compressed bytes, not the decoded picture -- and on this path there was
+    -- nothing to catch it: the 2026-09-25 log has 104 repeat renders costing
+    -- 17.9 s, and 96 of them had nothing between the two renders but ordinary
+    -- page turns. At a depth of STASH_DEPTH the entries that survive are worth
+    -- about 10.7 s of that; the rest are revisits far enough apart that no
+    -- sensible depth would have held them.
+    --
+    -- Each entry carries the rotation and the split it was rendered under, for
+    -- the same reason the halves carry the direction they were cut in: cropping
+    -- is skipped while the view is rotated and the split decides whether the
+    -- screen is the page or half of it, so the same index stands for a different
+    -- picture under different settings, and a finished buffer cannot be re-made
+    -- in place, only re-decoded.
+    local page_stash = {}
     -- Source page -> how many display slots it holds, 1 or 2. Filled in as
     -- pages are decoded, because looking at one is the only way to know, and
     -- measuring the whole chapter up front would mean downloading it before
@@ -1314,15 +1354,21 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
     -- the chain forever — the next page turn re-arms it anyway.
     local prefetch_deferrals = 0
     local last_failure_notice = 0
-    -- Consecutive prefetch failures, and the time the chain may run again. The
-    -- chain already stops on the first failure, but every page turn re-arms it,
-    -- so a reader flipping through a chapter on a dead link launches a fresh
-    -- synchronous fetch on every turn -- each one owning the UI thread for as
-    -- long as the block timeout allows (19 s and 31.5 s were both measured in
-    -- one session). A short circuit break turns those into one: after
-    -- PREFETCH_FAIL_MAX in a row the chain stays down until the cooldown has
-    -- passed, and a page turn goes back to being a page turn.
-    local prefetch_fails = 0
+    -- When the recent prefetch failures happened, oldest first, and the time the
+    -- chain may run again. The chain already stops on the first failure, but
+    -- every page turn re-arms it, so a reader flipping through a chapter on a
+    -- dead link launches a fresh synchronous fetch on every turn -- each one
+    -- owning the UI thread for as long as the block timeout allows (19 s and
+    -- 31.5 s were both measured in one session). A short circuit break turns
+    -- those into one: once PREFETCH_FAIL_MAX of them have landed inside one
+    -- PREFETCH_FAIL_WINDOW the chain stays down until the cooldown has passed,
+    -- and a page turn goes back to being a page turn.
+    --
+    -- Timestamps rather than a counter, and that is the whole point of the
+    -- change: the counter was reset by any success, so the failure this break
+    -- is for -- an intermittently bad link, fail-fail-succeed-fail-fail --
+    -- never reached the threshold, and the break never once fired on it.
+    local prefetch_fail_times = {}
     local prefetch_gate_until = 0
     -- Whether the updateProgress rewrite in fetchPageData has been reported.
     -- Once per chapter, not once per fetch: the rewrite is a property of the
@@ -1335,14 +1381,41 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
     local initial_source = nil
     local reported_progress = false
 
+    -- Two tunables that have to be locals of this function rather than
+    -- module-level ones, for the reason spelled out at atChapterEdge further
+    -- down: every module-level name this function mentions is one of *its*
+    -- upvalues, and it already sits at exactly 60, the LuaJIT ceiling. A new
+    -- module-level name referenced from in here would make it 61, and the
+    -- plugin loader would drop the whole plugin from every menu behind a single
+    -- WARN. Function-locals cost registers instead, which this function has.
+    --- The timeout fetchPageData gives a page the reader is actually waiting on,
+    --- in seconds. Deliberately not socketutil.FILE_BLOCK_TIMEOUT, which is 15:
+    --- the 2026-09-25 log puts the slowest *successful* page fetch at 1.87 s
+    --- (p95 1.62 s, p50 572 ms), so the last thirteen seconds of that limit only
+    --- ever bought a longer freeze — six turns in a row paid it in full at
+    --- 15 s each while the server was merely slow. Eight keeps 4x headroom over
+    --- the slowest success ever measured, and a turn that trips it is retried by
+    --- the reader tapping again, which is a far cheaper failure than a screen
+    --- that will not respond.
+    local FETCH_BLOCK_TIMEOUT = 8
+    --- The span, in seconds, over which prefetch failures are counted before the
+    --- chain is gated. Long enough to cover one bad patch of Wi-Fi, short enough
+    --- that a gate raised on it is not still in force long after the link came
+    --- back — PREFETCH_COOLDOWN is what decides length, this decides only what
+    --- counts as "the same bad patch".
+    local PREFETCH_FAIL_WINDOW = 60
+
     --- Lets the whole stash go. Called where every entry stops being valid at
-    --- once -- a change of auto-crop rebuilds every half differently -- and on
-    --- the way out, so it does not outlive the chapter. A change of reading
-    --- direction is handled per entry instead, in takeStashedHalf: it
-    --- invalidates the cut, not the buffers.
+    --- once -- a change of auto-crop or of tone rebuilds every half and every
+    --- whole page differently -- and on the way out, so it does not outlive the
+    --- chapter. A change of reading direction is handled per entry instead, in
+    --- takeStashedHalf: it invalidates the cut, not the buffers. So is a change
+    --- of rotation for whole pages, in takeStashedPage.
     local function dropStash()
         for i = 1, #stash_entries do stash_entries[i].bb:free() end
         stash_entries = {}
+        for i = 1, #page_stash do page_stash[i].bb:free() end
+        page_stash = {}
     end
 
     --- Keeps one half of a spread for the page turns around this one. The buffer
@@ -1408,6 +1481,73 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
     --- ImageViewer's constructor loads page one; treat that as upright.
     local function isRotated()
         return viewer and viewer.rotated or false
+    end
+
+    --- Keeps a whole page for the page turns around this one, keyed by the
+    --- 0-based source index like cache and crop_cache — the caller is working in
+    --- 1-based viewer pages, so it has to subtract the one. Same contract as
+    --- stashHalf otherwise: the buffer is owned here from now on, and the caller
+    --- must not free it or touch it again.
+    local function stashPage(index, bb)
+        for i = #page_stash, 1, -1 do
+            local entry = page_stash[i]
+            if entry.index == index then
+                -- The same page arriving twice in one step: keep the fresher
+                -- buffer rather than carrying the picture twice and evicting a
+                -- different page for the privilege.
+                entry.bb:free()
+                table.remove(page_stash, i)
+            end
+        end
+        table.insert(page_stash, 1, {
+            index = index, bb = bb,
+            -- The two settings that decide what "this page" is a picture of, and
+            -- they have to travel with the buffer because neither can be undone
+            -- in place: cropping is skipped while the view is rotated, and the
+            -- split decides whether the screen is the whole page or half of it.
+            -- Without the split here, a page stashed as a whole with the split
+            -- off would be handed back as one with the split on -- and it might
+            -- well be a spread that should have been cut, which is a wrong
+            -- picture, not a slow one.
+            rotated = isRotated(), split = splitOn(),
+        })
+        while #page_stash > STASH_DEPTH do
+            local evicted = table.remove(page_stash)
+            log("stash: evict whole page %d, %d kept", evicted.index, #page_stash)
+            evicted.bb:free()
+        end
+    end
+
+    --- A private copy of the stashed whole page, or nil. Spelled out rather than
+    --- sharing takeStashedHalf's body: the two keys mean different things, and
+    --- only this one has a rotation to compare instead of a reading direction.
+    --- The copy matters for the same reason it does there.
+    local function takeStashedPage(index)
+        for i = 1, #page_stash do
+            local entry = page_stash[i]
+            if entry.index == index then
+                -- Rendered under other settings, so it is not the picture being
+                -- asked for: worth one re-decode to avoid showing it. Dropped
+                -- rather than kept, so the next turn renders and re-stashes it
+                -- the right way instead of finding this one again — exactly what
+                -- the halves do for the reading direction. Rotation and the
+                -- split are both checked because both change the pixels, and
+                -- neither wipes the stash the way a change of crop or tone does.
+                if entry.rotated ~= isRotated() or entry.split ~= splitOn() then
+                    entry.bb:free()
+                    table.remove(page_stash, i)
+                    return nil
+                end
+                -- Asked for, so keep it, and move it to the front: the page the
+                -- reader is bouncing between should outlive the one a single
+                -- turn past put here. Only the ordering changes; the caller gets
+                -- a copy.
+                table.remove(page_stash, i)
+                table.insert(page_stash, 1, entry)
+                return copyBlitbuffer(entry.bb)
+            end
+        end
+        return nil
     end
 
     --- Whether a sheet is being cut in two at this moment. Rotation switches
@@ -1587,7 +1727,13 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
         if is_prefetch then
             socketutil:set_timeout(PREFETCH_BLOCK_TIMEOUT, PREFETCH_TOTAL_TIMEOUT)
         else
-            socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT, socketutil.FILE_TOTAL_TIMEOUT)
+            -- FETCH_BLOCK_TIMEOUT, not socketutil.FILE_BLOCK_TIMEOUT: see where
+            -- the constant is declared. This is the wait the reader sits through
+            -- with a dead screen, and the server either answers inside a couple
+            -- of seconds or is not going to, so the extra ones buy nothing but a
+            -- longer freeze. The total below still bounds a server that dribbles
+            -- an image out chunk by chunk.
+            socketutil:set_timeout(FETCH_BLOCK_TIMEOUT, socketutil.FILE_TOTAL_TIMEOUT)
         end
         local code, headers, status = socket.skip(1, http.request {
             url         = page_url,
@@ -1793,6 +1939,16 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
                     source = source or "stash"
                     is_spread = true
                 end
+            elseif not dualPageOn() then
+                -- The same for a whole page, which is every slot when the split
+                -- is off and the non-spread ones when it is on. Never consulted
+                -- under dual-page: there the slot is a stitched pair, so neither
+                -- source page on its own is the screen being asked for.
+                bb = takeStashedPage(index)
+                if bb then
+                    source = source or "stash"
+                    is_spread = false
+                end
             end
 
             if not bb then
@@ -1823,6 +1979,19 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
         end
 
         if #bbs == 1 then
+            -- Keep a copy of the finished screen, so that turning back onto this
+            -- page costs a memcpy instead of a decode. Guarded exactly as the
+            -- lookup above is, and that guard is not decoration: dual-page is
+            -- where an entry would be a copy nothing could ever read back -- the
+            -- lookup refuses to run under it -- so writing one there would spend
+            -- a full page-sized memcpy per turn on a slot that is a stitched pair
+            -- most of the time and a single page only at the ends.
+            -- `src` is a 1-based viewer page while the stash is keyed like the
+            -- caches, hence the -1.
+            if not spread and source ~= "stash" and not dualPageOn() then
+                local kept = copyBlitbuffer(bbs[1])
+                if kept then stashPage(src - 1, kept) end
+            end
             log("page %d: ready in %d ms via %s as %dx%d%s", key,
                 elapsedMs(started), source, bbs[1]:getWidth(), bbs[1]:getHeight(),
                 spread and string.format(" (half %d of sheet %d)", half, src) or "")
@@ -2312,9 +2481,10 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
             return
         end
         -- Circuit break in effect: leave the chain down for PREFETCH_COOLDOWN
-        -- after PREFETCH_FAIL_MAX failures in a row. Retrying on every page
-        -- turn against a link already known to be bad is what turned four slow
-        -- requests into 91 seconds of unresponsive UI in one measured session.
+        -- once PREFETCH_FAIL_MAX failures have landed inside one
+        -- PREFETCH_FAIL_WINDOW. Retrying on every page turn against a link
+        -- already known to be bad is what turned four slow requests into 91
+        -- seconds of unresponsive UI in one measured session.
         if now() < prefetch_gate_until then
             return
         end
@@ -2375,7 +2545,6 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
         if target == nil then return end
         local data = fetchPageData(target, true)
         if data then
-            prefetch_fails = 0
             cacheStore(target, data)
             diskCachePut(pageKey(target), data)
             if cache[target] == nil then
@@ -2389,13 +2558,22 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
             schedulePrefetch(PREFETCH_CHAIN_DELAY)
         else
             -- Counted towards the circuit break above. A lone failure costs
-            -- nothing extra: the gate only refuses future launches, and a
-            -- successful fetch resets the count.
-            prefetch_fails = prefetch_fails + 1
-            if prefetch_fails >= PREFETCH_FAIL_MAX then
-                prefetch_gate_until = now() + PREFETCH_COOLDOWN
-                log("prefetch: %d failures in a row, standing down for %d s",
-                    prefetch_fails, PREFETCH_COOLDOWN)
+            -- nothing extra: the gate only refuses future launches. A success
+            -- deliberately does *not* clear the record any more -- see the note
+            -- on prefetch_fail_times.
+            local t = now()
+            local kept = {}
+            for i = 1, #prefetch_fail_times do
+                if t - prefetch_fail_times[i] < PREFETCH_FAIL_WINDOW then
+                    kept[#kept + 1] = prefetch_fail_times[i]
+                end
+            end
+            kept[#kept + 1] = t
+            prefetch_fail_times = kept
+            if #prefetch_fail_times >= PREFETCH_FAIL_MAX then
+                prefetch_gate_until = t + PREFETCH_COOLDOWN
+                log("prefetch: %d failures in %d s, standing down for %d s",
+                    #prefetch_fail_times, PREFETCH_FAIL_WINDOW, PREFETCH_COOLDOWN)
             end
         end
     end
