@@ -2664,6 +2664,50 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
         end
     end
 
+    -- The frontlight panel, hung on the one long press that already means "this
+    -- is too dark" for gamma. Reached by broadcast rather than by calling
+    -- Device:showLightDialog(), and that is the whole point of doing it this
+    -- way: the widget adapts itself to the device, so this file needs no
+    -- per-model branch at all. It builds the Warmth section only where the
+    -- panel reports natural light, and the Configure button only on the boards
+    -- that have neither a mixer nor an API (frontlightwidget.lua:65-66, 323) --
+    -- so one call covers a plain white frontlight, an Aura One's R/G/B
+    -- ComfortLight, and a newer mixed-light board, and a device with no
+    -- frontlight never gets here in the first place.
+    --
+    -- `ShowFlDialog` is exactly what the stock settings menu sends
+    -- (common_settings_menu_table.lua:36) instead of calling showLightDialog
+    -- directly: broadcastEvent walks every window-level widget without
+    -- stopping, where sendEvent only reaches the topmost one and the active
+    -- ones, so anything else that cares about the frontlight still hears it.
+    --
+    -- Two things here are load-bearing and neither is stylistic:
+    --
+    --   * **The guard must be called.** Every capability flag on Device is a
+    --     *function*, not a boolean -- generic/device.lua:70-71 defines
+    --     `yes`/`no` as `function yes() return true end`. So
+    --     `Device.hasFrontlight` without parentheses is truthy on every
+    --     device ever made, and this key would open a panel whose slider
+    --     moves nothing on a reader that has no light.
+    --   * **The requires are in here, as locals.** streamPages sits at
+    --     exactly 60 upvalues with zero headroom, and a module-level
+    --     reference is what pushes it to 61 and makes the plugin vanish from
+    --     every menu. A local costs nothing; see the note on toggleRotation
+    --     below and NOTES 5h.
+    --
+    -- Left nil when there is no frontlight, matching hold_goto above: an
+    -- inert key beats a control that cannot do anything.
+    local hold_frontlight
+    do
+        local device = require("device")
+        if device:hasFrontlight() then
+            local Event = require("ui/event")
+            hold_frontlight = function()
+                UIManager:broadcastEvent(Event:new("ShowFlDialog"))
+            end
+        end
+    end
+
     viewer.button_table = ButtonTable:new{
         width = viewer.width - 2 * viewer.button_padding,
         buttons = {
@@ -2787,6 +2831,12 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
                             end,
                         })
                     end,
+                    -- Same button, the other kind of "make it brighter": the tap
+                    -- stays on the picture's own gamma, the long press opens the
+                    -- device's light. Keeps the rule the other two long presses
+                    -- already follow -- a hold is the finer layer of the same
+                    -- category (rotate -> display panel, go to -> chapter list).
+                    hold_callback = hold_frontlight,
                 },
                 {
                     id = "close",

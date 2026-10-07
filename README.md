@@ -37,6 +37,7 @@ Kobo 墨水屏实机，点图看原图 · on a Kobo, tap an image for the full s
 - **翻页不看转圈**：提前抓取后续页；内存缓存 16 MB，可选磁盘缓存（默认关，上限 64 MB）。
 - **图标工具栏**：底部一排图标按钮（适屏 / 旋转 / 跳页 / 裁剪 / 明暗 / 关闭），和 KOReader 自带阅读器一样。
 - **明暗调节**：扫描发白或太暗时一键调整——0.5 ~ 0.9 提亮（步长 0.1）、**1.0 原样**、2 ~ 10 加深（步长 1.0）。JPEG / PNG / GIF / WebP / SVG 都支持。
+- **前光面板**：长按工具栏的「明暗」打开设备前光——亮度、暖光（设备支持时），带可调色温 LED 的机型还多一项色温配置。面板是 KOReader 自己的，各项按机型能力显示；没有前光的设备上这个长按不生效。
 - **自动去白边**（默认关）。
 - **三种显示方式**：单页 / 双页 / 拆页。拆页把横着的跨页扫描按中线切成两页分别看；转横屏自动开双页。
 - **文件夹快捷方式**：任意文件夹放一个 `.opdscomic` 空文件，点它直接进 OPDS。
@@ -78,7 +79,7 @@ Kobo 墨水屏实机，点图看原图 · on a Kobo, tap an image for the full s
 
 **② 建快捷方式**：在任意文件夹新建一个**空文件**，扩展名改成 `.opdscomic`（文件名随意），回到文件管理器**点它**就直接进 OPDS 界面。
 
-**③ 阅读**：点屏幕**中间三分之一**唤出底部图标工具栏：适屏 / 旋转 / 跳页 / 裁剪 / 明暗 / 关闭。**长按「旋转」**打开显示面板（双页、拆页、从右到左、封面单屏）；**长按「跳页」**打开章节导航（前后各 5 章，当前章标「正在阅读」）。「从右到左」默认开启，左开本漫画在面板里关掉。
+**③ 阅读**：点屏幕**中间三分之一**唤出底部图标工具栏：适屏 / 旋转 / 跳页 / 裁剪 / 明暗 / 关闭。**长按「旋转」**打开显示面板（双页、拆页、从右到左、封面单屏）；**长按「跳页」**打开章节导航（前后各 5 章，当前章标「正在阅读」）；**长按「明暗」**打开设备前光面板（亮度、暖光，有的话）。「从右到左」默认开启，左开本漫画在面板里关掉。
 
 **拆页**：有些资源把跨页存成一张横图，打开拆页后按中线切开，两页各占一屏；跳页和页码仍按服务器原始页号。已知短板：扫描时就转了 90° 的单页也是横的，会被切开，遇到只能关掉这个开关。
 
@@ -112,6 +113,7 @@ Read comics straight from an OPDS server (Suwayomi, Komga) without downloading t
 - **No spinner between pages**: the next pages are fetched ahead of you — 16 MB in RAM, plus an optional disk cache (off by default, 64 MB).
 - **Icon toolbar**: a bottom row of icons (Scale / Rotate / Go to / Crop / Tone / Close), same style as KOReader's own readers.
 - **Tone**: fix washed-out or too-dark scans — 0.5 – 0.9 brightens (step 0.1), **1.0 untouched**, 2 – 10 darkens (step 1.0). JPEG / PNG / GIF / WebP / SVG.
+- **Frontlight panel**: long press `Tone` in the toolbar for the device's frontlight — brightness, warmth where the device has it, and a colour configuration on boards with adjustable-temperature LEDs. It is KOReader's own panel, so it shows only what the device actually reports; on a reader with no frontlight the long press does nothing.
 - **Auto margin crop** (off by default).
 - **Three display modes**: single / two pages / split — the split cuts a landscape spread scan back into two pages, and going landscape turns on two-page automatically.
 - **Folder shortcut**: a `.opdscomic` empty file opens the catalog with one tap.
@@ -153,7 +155,7 @@ Nothing to configure on the plugin side: install the remote app and put both on 
 
 **② Make a shortcut**: create an **empty file** with a `.opdscomic` extension (any name) in any folder; back in the file manager, **tap it** to open the catalog.
 
-**③ Read**: tap the **middle third** of the screen for the bottom icon toolbar: Scale / Rotate / Go to / Crop / Tone / Close. **Long press Rotate** for the display panel (two pages, split, right to left, cover first); **long press the `Go to` icon** for the chapter navigator — five chapters either way, with the current one marked. "Right to left" is on by default; turn it off for left-bound books.
+**③ Read**: tap the **middle third** of the screen for the bottom icon toolbar: Scale / Rotate / Go to / Crop / Tone / Close. **Long press Rotate** for the display panel (two pages, split, right to left, cover first); **long press the `Go to` icon** for the chapter navigator — five chapters either way, with the current one marked; **long press `Tone`** for the device's frontlight panel (brightness, warmth where available). "Right to left" is on by default; turn it off for left-bound books.
 
 **Split**: releases that store a spread as one landscape image are cut at the middle, so each page gets its own screen. `Go to` and the page counter keep the server's original page numbers. Known gap: a single page stored a quarter-turn rotated is also landscape and will be cut — turn the switch off for those.
 
