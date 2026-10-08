@@ -28,10 +28,10 @@ local _ = require("gettext")
 local N_ = _.ngettext
 local T = ffiUtil.template
 
--- Raw feeds and their HTTP validators, bounded to 20 catalogs.
+-- Raw feeds and their HTTP validators: at most 20 entries and 8 MiB.
 local CatalogCache = Cache:new{
-    -- Make it 20 slots, with no storage space constraints
-    slots = 20,
+    size = 8 * 1024 * 1024,
+    avg_itemsize = math.ceil(8 * 1024 * 1024 / 20),
 }
 
 -- logger.info is not printf. It walks its varargs, tostrings each one and joins
@@ -491,13 +491,13 @@ function OPDSBrowser:parseFeed(item_url, quiet)
         .. "\0" .. (self.root_catalog_password or "")
     local cached = CatalogCache:check(key)
     local feed, headers, code = self:fetchFeed(item_url, false, cached, quiet)
-    if feed and headers then
+    if feed and headers and #feed + #key + 256 <= 8 * 1024 * 1024 then
         CatalogCache:insert(key, {
             feed = feed,
             etag = headers.etag or (code == 304 and cached and cached.etag or nil),
             last_modified = headers["last-modified"]
                 or (code == 304 and cached and cached.last_modified or nil),
-        })
+        }, #feed + #key + 256)
     end
     if feed then feed = feed:gsub("^\239\187\191", ""):match("^%s*(.*)$") end
     local start = feed and feed:sub(1, 1)
@@ -1562,10 +1562,16 @@ function OPDSBrowser:suwayomiChapterNav(item)
     if list_is_on_screen then
         -- Seed the navigation cache from the already displayed catalog. Further
         -- pages are fetched only when the chooser needs neighbours past its end.
-        self.suwayomi_series_cache = self.suwayomi_series_cache or {}
-        self.suwayomi_series_cache[series_url] = {
-            chapters = chapters, title = title, next_url = hrefs.next, pages = 1,
-        }
+        local cache = self:suwayomiSeriesCache(series_url)
+        if cache[series_url] and cache[series_url].seed_list == list then
+            local loaded, at = self:suwayomiSeriesChapters(item, series_url)
+            if loaded then chapters, index = loaded, at end
+        else
+            cache[series_url] = {
+                chapters = chapters, title = title, next_url = hrefs.next, pages = 1,
+                checked_at = os.time(), accessed_at = os.time(), seed_list = list,
+            }
+        end
     end
     local nav = { chapters = chapters, index = index, open = open, show_list = show_list }
     nav.ensure_neighbors = function(span)
@@ -1597,13 +1603,50 @@ end
 -- else -- which is exactly what every chapter had before the feature existed.
 local SERIES_PAGE_LIMIT = 10
 
-function OPDSBrowser:suwayomiSeriesChapters(item, series_url, neighbors)
-    self.suwayomi_series_cache = self.suwayomi_series_cache or {}
-    local series = self.suwayomi_series_cache[series_url]
-    if not series then
-        series = { chapters = {}, next_url = series_url, pages = 0 }
-        self.suwayomi_series_cache[series_url] = series
+-- Bound long reading sessions and isolate navigation after account changes.
+function OPDSBrowser:suwayomiSeriesCache(series_url)
+    local auth = (self.root_catalog_username or "") .. "\0" .. (self.root_catalog_password or "")
+    if self.suwayomi_series_auth ~= auth then
+        self.suwayomi_series_cache = {}
+        self.suwayomi_series_auth = auth
     end
+    local cache = self.suwayomi_series_cache
+    local size, oldest, oldest_at = 0
+    for key, entry in pairs(cache) do
+        size = size + 1
+        if key ~= series_url and (not oldest or (entry.accessed_at or 0) < oldest_at) then
+            oldest, oldest_at = key, entry.accessed_at or 0
+        end
+    end
+    if not cache[series_url] and size >= 12 and oldest then cache[oldest] = nil end
+    return cache
+end
+
+function OPDSBrowser:suwayomiSeriesChapters(item, series_url, neighbors)
+    local cache = self:suwayomiSeriesCache(series_url)
+    local series = cache[series_url]
+    local timestamp = os.time()
+    local previous, previous_index
+    if series then
+        for index, entry in ipairs(series.chapters) do
+            if entry.url == item.url then previous_index = index; break end
+        end
+        local age = timestamp - (series.checked_at or 0)
+        local terminal = not series.next_url and previous_index
+            and #series.chapters - previous_index < (neighbors or 0)
+        if age >= 300 or (terminal and age >= 30) then
+            previous = series
+            -- Retry is throttled even on failure, while the old navigation stays usable.
+            previous.checked_at = timestamp
+            series = nil
+        end
+    end
+    if not series then
+        series = { chapters = {}, next_url = series_url, pages = 0, checked_at = timestamp,
+            seed_list = previous and previous.seed_list }
+    end
+    series.accessed_at = timestamp
+    local failed = false
     local found_index
     while true do
         -- What is already in hand, before asking for more: this is the common
@@ -1617,6 +1660,7 @@ function OPDSBrowser:suwayomiSeriesChapters(item, series_url, neighbors)
         end
         if found_index and (#series.chapters - found_index >= (neighbors or 0)
             or not series.next_url or series.pages >= SERIES_PAGE_LIMIT) then
+            cache[series_url] = series
             return series.chapters, found_index, series.title
         end
         if not series.next_url or series.pages >= SERIES_PAGE_LIMIT then break end
@@ -1628,6 +1672,7 @@ function OPDSBrowser:suwayomiSeriesChapters(item, series_url, neighbors)
         -- A failure ends the walk but keeps what was already read, and leaves
         -- the page to be asked for again rather than remembered as empty.
         if not ok or not catalog then
+            failed = true
             logger.info(string.format("Suwayomi series: chapter feed failed at %s", url))
             break
         end
@@ -1651,7 +1696,7 @@ function OPDSBrowser:suwayomiSeriesChapters(item, series_url, neighbors)
         local title, facets, search = self.catalog_title, self.facet_groups, self.search_url
         local generated, menu_table = pcall(self.genItemTableFromCatalog, self, catalog, url)
         self.catalog_title, self.facet_groups, self.search_url = title, facets, search
-        if not generated then break end
+        if not generated then failed = true; break end
         local known = {}
         for _, entry in ipairs(series.chapters) do known[entry.url] = true end
         for _, entry in ipairs(menu_table) do
@@ -1674,6 +1719,11 @@ function OPDSBrowser:suwayomiSeriesChapters(item, series_url, neighbors)
         local hrefs = menu_table.hrefs
         series.next_url = type(hrefs) == "table" and hrefs.next or nil
     end
+    if failed and previous and previous_index then
+        previous.accessed_at = timestamp
+        return previous.chapters, previous_index, previous.title
+    end
+    cache[series_url] = series
     if found_index then return series.chapters, found_index, series.title end
     -- Not in anything that was read, for one of two different reasons, and the
     -- log has to tell them apart.

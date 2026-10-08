@@ -211,4 +211,16 @@ function OPDS:onFlushSettings()
     end
 end
 
+function OPDS:onCloseWidget()
+    local pse = require("opdsforcomic_pse")
+    if pse.progress_queue then
+        pse.progress_queue:close()
+        pse.progress_queue = nil
+    end
+    require("opdsforcomic_worker").closeAll()
+end
+
+-- Exit and USBMS can tear down the UI before another scheduled tick runs.
+OPDS.onExit = OPDS.onCloseWidget
+
 return OPDS

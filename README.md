@@ -5,7 +5,7 @@ An OPDS client for KOReader: read comics from a server, with page prefetching, t
 
 **语言 / Language:** [中文](#中文) · [English](#english)
 
-**当前版本 / Current version: [0.1.5](https://github.com/hugo1120/opdsforcomic.koplugin/releases/tag/0.1.5)**（2026-10-08）
+**当前版本 / Current version: [0.1.6](https://github.com/hugo1120/opdsforcomic.koplugin/releases/tag/0.1.6)**（2026-10-08）
 
 ---
 
@@ -32,13 +32,14 @@ Kobo 墨水屏实机，点图看原图 · on a Kobo, tap an image for the full s
 
 ## 中文
 
-更新记录见 [0.1.5 Release](https://github.com/hugo1120/opdsforcomic.koplugin/releases/tag/0.1.5)。
+更新记录见 [0.1.6 Release](https://github.com/hugo1120/opdsforcomic.koplugin/releases/tag/0.1.6)。
 
 ### 功能
 
 从 OPDS 服务器（Suwayomi、Komga）直接看漫画，不用先下载到本地。派生自 KOReader 内置的 `opds.koplugin`，两者可同时启用。
 
-- **页面预取与缓存**：提前抓取后续页；压缩数据内存缓存目标 16 MiB，解码后的整页、半页缓存合计最多保留 64 MiB；可选磁盘缓存默认关闭，上限 64 MiB。缓存预算不代表进程内存峰值。
+- **页面预取与缓存**：提前抓取后续页；压缩数据内存缓存目标 8 MiB（至少保留两页），解码后的整页、半页缓存单张最多 8 MiB、合计最多 16 MiB；可选磁盘缓存默认关闭，上限 64 MiB。缓存预算不代表进程内存峰值。
+- **超大图低内存解码**：黑白屏（如 512 MB 的 Kobo）上超过约 800 万像素的 PNG/JPEG 走低内存路线——PNG 直接解成灰度再原生缩小，JPEG 在解码时缩小，保留约 800 万像素的灰度阅读副本。适屏阅读清晰度保持正常，高倍率放大的细节会少于原图；彩色屏与普通尺寸图片不变。
 - **图标工具栏**：底部一排图标按钮（适屏 / 旋转 / 跳页 / 裁剪 / 明暗 / 关闭），和 KOReader 自带阅读器一样。
 - **明暗调节**：扫描发白或太暗时一键调整——0.5 ~ 0.9 提亮（步长 0.1）、**1.0 原样**、2 ~ 10 加深（步长 1.0）。JPEG / PNG / GIF / WebP / SVG 都支持。
 - **前光面板**：长按工具栏的「明暗」打开设备前光——亮度、暖光（设备支持时），带可调色温 LED 的机型还多一项色温配置。面板是 KOReader 自己的，各项按机型能力显示；没有前光的设备上这个长按不生效。
@@ -62,7 +63,7 @@ Kobo 墨水屏实机，点图看原图 · on a Kobo, tap an image for the full s
 
 ### 安装
 
-1. 从 [0.1.5 Release](https://github.com/hugo1120/opdsforcomic.koplugin/releases/tag/0.1.5) 下载 `opdsforcomic.koplugin.zip`，解压出 `opdsforcomic.koplugin` 文件夹。
+1. 从 [0.1.6 Release](https://github.com/hugo1120/opdsforcomic.koplugin/releases/tag/0.1.6) 下载 `opdsforcomic.koplugin.zip`，解压出 `opdsforcomic.koplugin` 文件夹。
 2. 整个文件夹放进 KOReader 的 `plugins/`：Kobo `.adds/koreader/plugins/`，Kindle `koreader/plugins/`，Android `/sdcard/koreader/plugins/`，桌面 `~/.config/koreader/plugins/`。
 3. 完全退出 KOReader 再启动。
 
@@ -110,13 +111,14 @@ Kobo 墨水屏实机，点图看原图 · on a Kobo, tap an image for the full s
 
 ## English
 
-See the [0.1.5 Release](https://github.com/hugo1120/opdsforcomic.koplugin/releases/tag/0.1.5) for the changelog.
+See the [0.1.6 Release](https://github.com/hugo1120/opdsforcomic.koplugin/releases/tag/0.1.6) for the changelog.
 
 ### Features
 
 Read comics straight from an OPDS server (Suwayomi, Komga) without downloading them first. A fork of KOReader's bundled `opds.koplugin`; both can be enabled at once.
 
-- **Page prefetching and caching**: compressed data targets a 16 MiB RAM budget; decoded whole pages and halves retain up to 64 MiB in total. An optional disk cache is off by default and capped at 64 MiB. These budgets do not cap peak process memory.
+- **Page prefetching and caching**: compressed data targets an 8 MiB RAM budget, keeping at least two pages; decoded whole pages and halves retain up to 8 MiB each and 16 MiB in total. An optional disk cache is off by default and capped at 64 MiB. These budgets do not cap peak process memory.
+- **Low-memory decoding for oversized images**: on a monochrome screen (a 512 MB Kobo, say), PNG/JPEG above roughly 8 megapixels take a low-memory path — PNG decodes straight to grayscale and is then scaled natively, JPEG is scaled while decoding, keeping a ~8-megapixel grayscale reading copy. Fit-to-screen sharpness is unchanged; zooming in shows less detail than the original. Colour screens and ordinary sizes are unaffected.
 - **Icon toolbar**: a bottom row of icons (Scale / Rotate / Go to / Crop / Tone / Close), same style as KOReader's own readers.
 - **Tone**: fix washed-out or too-dark scans — 0.5 – 0.9 brightens (step 0.1), **1.0 untouched**, 2 – 10 darkens (step 1.0). JPEG / PNG / GIF / WebP / SVG.
 - **Frontlight panel**: long press `Tone` in the toolbar for the device's frontlight — brightness, warmth where the device has it, and a colour configuration on boards with adjustable-temperature LEDs. It is KOReader's own panel, so it shows only what the device actually reports; on a reader with no frontlight the long press does nothing.
@@ -140,7 +142,7 @@ Nothing to configure on the plugin side: install the remote app and put both on 
 
 ### Installation
 
-1. Download `opdsforcomic.koplugin.zip` from the [0.1.5 Release](https://github.com/hugo1120/opdsforcomic.koplugin/releases/tag/0.1.5) and unzip it to get the `opdsforcomic.koplugin` folder.
+1. Download `opdsforcomic.koplugin.zip` from the [0.1.6 Release](https://github.com/hugo1120/opdsforcomic.koplugin/releases/tag/0.1.6) and unzip it to get the `opdsforcomic.koplugin` folder.
 2. Move the whole folder into KOReader's `plugins/`: Kobo `.adds/koreader/plugins/`, Kindle `koreader/plugins/`, Android `/sdcard/koreader/plugins/`, desktop `~/.config/koreader/plugins/`.
 3. Quit KOReader completely and start it again.
 

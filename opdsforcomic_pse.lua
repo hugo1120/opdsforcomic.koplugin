@@ -30,7 +30,7 @@ This fork keeps pages either side of the current one ready:
 
   * raw image bytes, evicting pages furthest from the current source page
   * optional disk cache (disabled by default)
-  * scheduled synchronous prefetch while the reader is looking at a page
+  * cancellable subprocess prefetch while the reader is looking at a page
   * decoded whole pages and halves with a shared 64 MiB stash budget
 
 ImageViewer owns and frees every buffer handed to it. Stash hits return a
@@ -47,16 +47,10 @@ private copy, so the cached original never becomes a freed viewer buffer.
 local PREFETCH_AHEAD = 3
 local PREFETCH_BEHIND = 2
 --- How long to wait after a page turn before fetching, in seconds. Lets the
---- e-ink refresh settle before the UI thread blocks on a fetch.
+--- e-ink refresh settle before launching a background fetch.
 local PREFETCH_DELAY = 0.35
 --- Delay between successive fetches while filling the window. Shorter than
---- PREFETCH_DELAY, which exists to let a page turn settle, but no longer
---- near-zero: each step is a *synchronous* fetch that owns the UI thread, so
---- back-to-back steps meant several hundred milliseconds of dead input right
---- after every page turn — the moment the reader is most likely to tap
---- something. The window fills at the speed of the link, not of the timer, so
---- a quarter second between steps costs almost nothing and leaves room for a
---- tap to be served in between.
+--- PREFETCH_DELAY; limits process churn while the cache fills.
 local PREFETCH_CHAIN_DELAY = 0.25
 --- When a dialog is on top of the viewer, a prefetch is postponed by this
 --- much and retried, up to PREFETCH_DEFER_MAX times, instead of blocking the
@@ -66,12 +60,11 @@ local PREFETCH_DEFER_MAX = 20
 --- Memory cache bound, in bytes rather than pages, so a server with large
 --- pages keeps fewer of them instead of quietly eating memory. MIN_PAGES is
 --- the floor that keeps it usable even when a single page is huge.
-local MEM_CACHE_MAX_BYTES = 16 * 1024 * 1024
-local MEM_CACHE_MIN_PAGES = 4
+local MEM_CACHE_MAX_BYTES = 8 * 1024 * 1024
+local MEM_CACHE_MIN_PAGES = 2
 --- Prefetch timeouts, in seconds. Shorter than the ones used for a
---- user-initiated page turn, because a prefetch blocks the UI unannounced
---- while the reader is looking at another page — but not so short that a
---- merely slow page gets killed and fetched twice. Six was picked against an
+--- user-initiated page turn, to bound speculative network work without killing
+--- merely slow requests too early. Six was picked against an
 --- older baseline; the 2026-09-25 log puts a *successful* prefetch at p95
 --- 802 ms and 1.76 s at its slowest, and shows 38 of them sitting on the full
 --- six seconds while the server was merely slow. Three still clears the slowest
@@ -94,10 +87,8 @@ local PREFETCH_COOLDOWN = 45
 --- The close-time progress report. How long to wait after the viewer closes
 --- before sending it, and the timeouts for the request itself, in seconds.
 ---
---- Much tighter than a page turn's: nobody is waiting for an answer, but the
---- request is synchronous and owns the UI thread, so overshooting it is felt as
---- the file browser freezing. The delay exists so the browser has painted and
---- the hitch, if there is one, lands after the screen has settled.
+--- Reports run in a serial subprocess queue. The delay lets the browser paint;
+--- socket and worker deadlines bound both network waits and DNS resolution.
 local PROGRESS_REPORT_DELAY = 1
 local PROGRESS_BLOCK_TIMEOUT = 4
 local PROGRESS_TOTAL_TIMEOUT = 8
@@ -146,17 +137,11 @@ local MAX_DECODE_SCALE = 0
 --- halves -- 10.1 s of a 43-render session spent decoding pictures the reader
 --- had already seen.
 ---
---- The bill is memory, and it is the reason this is a constant rather than a
---- hard-coded 3. Each entry is a full-resolution BBRGB24 half, 15-16 MB on this
---- panel, so depth three holds ~47 MB. Counting the short-lived sheet (35.9 MB)
---- and the two uncut halves (17.9 MB each) that exist at the same time, one
---- spread render peaks near 141 MB of decoded buffers; KOReader itself sits
---- somewhere between 30 MB and 140 MB depending on how long it has been reading
---- manga. On a 512 MB device that is fine -- the project's own guidance is that
---- 200-300 MB is still survivable -- but it is not free, MAX_DECODE_SCALE is
---- the lever if it ever stops fitting, and the sanity check is the "High memory
---- usage" alarm, which reads the process RSS out of /proc/self/statm and so
---- does see these buffers.
+--- Depth is also limited by the shared 16 MiB byte budget and an 8 MiB
+--- per-entry admission limit. Large monochrome PNG/JPEG pages are reduced by
+--- the low-memory decoder before splitting; the cache never retains their
+--- full-resolution buffers. KOReader's memory warning is only an alert, not
+--- an allocation limit, so these budgets must leave room for decode and UI.
 local STASH_DEPTH = 3
 
 --- Auto page crop, trimming blank margins. Off by default: it costs a grid of
@@ -732,12 +717,19 @@ end
 --- -- and eventually frees -- the original. The page table is marked
 --- image_disposable, so the viewer frees whatever the page table hands it;
 --- anything the plugin wants to hold past that hand-over has to be a copy.
-local function copyBlitbuffer(bb)
+local function copyBlitbuffer(bb, for_stash)
+    if for_stash and not require("opdsforcomic_perf").canStash(bb) then return nil end
     local w, h = bb:getWidth(), bb:getHeight()
     local Blitbuffer = require("ffi/blitbuffer")
-    local copy = Blitbuffer.new(w, h, bb:getType())
-    if not copy then return nil end
-    copy:blitFrom(bb, 0, 0, 0, 0, w, h)
+    local copy
+    local ok = pcall(function()
+        copy = Blitbuffer.new(w, h, bb:getType())
+        if copy then copy:blitFrom(bb, 0, 0, 0, 0, w, h) end
+    end)
+    if not ok then
+        if copy then copy:free() end
+        return nil
+    end
     return copy
 end
 
@@ -812,12 +804,16 @@ local function renderSlot(data, index, half, rotated, crop_cache, half_crop_cach
     -- unknown, and on the fused form the one clip is reported as cut with crop
     -- at zero. The log says which form it was.
     local started = now()
-    local bb = RenderImage:renderImageData(data, #data, false)
+    local bb, failure, detail = require("opdsforcomic_image").decode(data, log)
     if not bb then
-        log("page %d: decode failed (%d bytes)", index, #data)
-        return nil, false
+        log("page %d: decode failed (%d bytes, %s): %s", index, #data,
+            tostring(failure), tostring(detail))
+        return nil, false, failure
     end
     local decode_ms = elapsedMs(started)
+    local gray_started = now()
+    bb = require("opdsforcomic_perf").grayscale(bb, log)
+    log("page %d: grayscale %d ms", index, elapsedMs(gray_started))
     local gamma_ms, darken_ok = 0, false
     local cut_ms, crop_ms, keep_ms = 0, 0, 0
     local gamma_value = gammaValue()
@@ -925,7 +921,7 @@ local function renderSlot(data, index, half, rotated, crop_cache, half_crop_cach
                 -- the viewer frees whatever the page table gives it.
                 if stash then
                     local keep_started = now()
-                    local kept = copyBlitbuffer(bb)
+                    local kept = copyBlitbuffer(bb, true)
                     keep_ms = elapsedMs(keep_started)
                     if kept then stash(mine_key, kept) end
                 end
@@ -1179,7 +1175,7 @@ function OPDSPSE:trimStash(halves, pages)
             total = total + entry.bb.stride * entry.bb.h
         end
     end
-    while total > 64 * 1024 * 1024 do
+    while total > 16 * 1024 * 1024 do
         local half, page = halves[#halves], pages[#pages]
         local list = halves
         if not half or (page and page.used < half.used) then list = pages end
@@ -1282,6 +1278,18 @@ end
 --- whole switch: with it the reader behaves exactly as it did before, including
 --- doing nothing at all at the ends of the list.
 function OPDSPSE:streamPages(remote_url, count, continue, username, password, last_page_read, chapter_nav)
+    local Perf = require("opdsforcomic_perf")
+    local prefetch_state = { direction = 1 }
+    local worker = require("opdsforcomic_worker"):new{
+        now = now, timeout = PREFETCH_TOTAL_TIMEOUT + 5, max_bytes = MEM_CACHE_MAX_BYTES,
+    }
+    OPDSPSE.progress_queue = OPDSPSE.progress_queue or require("opdsforcomic_worker").Queue:new{
+        now = now, timeout = PROGRESS_TOTAL_TIMEOUT + 2, max_bytes = 64, max_pending = 12,
+    }
+    worker.progress_queue = OPDSPSE.progress_queue
+    -- Invalidate old/deferred reports before this reader can send newer progress.
+    worker.progress_session = worker.progress_queue:begin(
+        remote_url .. "\0" .. (username or "") .. "\0" .. (password or ""))
     -- attempt to pull chapter progress from Kavita if user pressed
     -- "Page Stream" button.
     -- We have to pull the progress here, otherwise the creation of the page_table
@@ -1299,11 +1307,12 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
     --
     -- The token after the label is the whole point, so it changes whenever the
     -- build does. 2026-09-16c shipped as 0.1.2 and is what the 2026-09-25 audit
-    -- was taken against; 2026-09-25 is the timeout/breaker/stash round, and the
-    -- prefetch breaker's own line ("N failures in 60 s") is the other place a
+    -- was taken against; 2026-09-25 is the timeout/breaker/stash round;
+    -- 2026-10-08 is the low-memory and module-split round. The prefetch
+    -- breaker's own line ("N failures in 60 s") is the other place a
     -- log says which of the two it came from. The label stays "perf-fixes" so
     -- the tooling that slices on it keeps working.
-    log("opening stream: %d pages [perf-fixes 0.1.5]", count)
+    log("opening stream: %d pages [perf-fixes 0.1.6]", count)
 
     -- Raw image bytes, keyed by 0-based page index (ImageViewer page numbers
     -- are 1-based, so index == key - 1, as elsewhere in this file).
@@ -1394,7 +1403,6 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
     -- Whether the updateProgress rewrite in fetchPageData has been reported.
     -- Once per chapter, not once per fetch: the rewrite is a property of the
     -- catalog's template, so repeating it every prefetch would be noise.
-    local progress_flag_logged = false
     -- Where the chapter opened, and whether the close-time report has been
     -- sent. Both belong to the chapter, not to a page: the report tells the
     -- catalog where the reader stopped, and it is only worth sending if that is
@@ -1443,6 +1451,7 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
     --- is owned here from now on: the caller hands it over and must not free it
     --- or touch it again.
     local function stashHalf(key, bb)
+        if not Perf.canStash(bb) then bb:free(); return end
         -- A key can arrive twice only if a slot is rendered, turned away from
         -- and rendered again inside one step. Then the buffer already held is
         -- the same half, and the incoming one is the fresher: drop the old,
@@ -1514,6 +1523,7 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
     --- stashHalf otherwise: the buffer is owned here from now on, and the caller
     --- must not free it or touch it again.
     local function stashPage(index, bb)
+        if not Perf.canStash(bb) then bb:free(); return end
         for i = #page_stash, 1, -1 do
             local entry = page_stash[i]
             if entry.index == index then
@@ -1689,6 +1699,15 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
     end
 
     local function cacheStore(index, data, is_prefetch)
+        if is_prefetch then
+            local current = viewer and ((sourceOfSlot(viewer._images_list_cur or 1) or 1) - 1) or 0
+            local evict = Perf.rawAdmission(cache, index, #data, current, MEM_CACHE_MAX_BYTES)
+            if not evict then return false end
+            for _, old in ipairs(evict) do
+                cache_bytes = cache_bytes - #cache[old]
+                cache[old] = nil
+            end
+        end
         local previous = cache[index]
         if previous then
             cache_bytes = cache_bytes - #previous
@@ -1696,6 +1715,7 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
         cache[index] = data
         cache_bytes = cache_bytes + #data
         cacheEvict(not is_prefetch and index or nil)
+        return cache[index] ~= nil
     end
 
     local function cacheDrop(index)
@@ -1731,12 +1751,7 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
         -- in "updateProgress" cannot be hit, and whatever separator the
         -- catalog used survives the rewrite.
         if is_prefetch then
-            local before = page_url
             page_url = page_url:gsub("([?&])updateProgress=[^&]*", "%1updateProgress=false")
-            if page_url ~= before and not progress_flag_logged then
-                progress_flag_logged = true
-                log("prefetch: updateProgress forced to false, page turns stay authoritative")
-            end
         end
         local parsed = url.parse(page_url)
         if parsed.scheme ~= "http" and parsed.scheme ~= "https" then
@@ -1763,7 +1778,9 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
             -- an image out chunk by chunk.
             socketutil:set_timeout(FETCH_BLOCK_TIMEOUT, socketutil.FILE_TOTAL_TIMEOUT)
         end
-        local code, headers, status = socket.skip(1, http.request {
+        local sink = socketutil.table_sink(page_data)
+        local received = 0
+        local requested, result, code, headers, status = pcall(http.request, {
             url         = page_url,
             headers     = {
                 ["Accept-Encoding"] = "identity",
@@ -1775,23 +1792,30 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
             -- path, so it is the one place where a server that dribbles an
             -- image out holds the UI thread for as long as it likes -- measured
             -- at 19 s and 31 s against a nominal limit of 15 s.
-            sink        = socketutil.table_sink(page_data),
+            sink        = function(chunk, err)
+                received = received + (chunk and #chunk or 0)
+                if is_prefetch and received > MEM_CACHE_MAX_BYTES then return nil, "prefetch byte budget" end
+                return sink(chunk, err)
+            end,
             user        = username,
             password    = password,
         })
         socketutil:reset_timeout()
         local elapsed = elapsedMs(started)
 
-        if code == 200 then
+        if requested and code == 200 and result then
             local data = table.concat(page_data)
+            local expected = headers and tonumber(headers["content-length"])
+            if #data == 0 or (expected and #data ~= expected) then return nil, "incomplete image" end
             log("page %d: %s fetched %d bytes in %d ms",
                 index, is_prefetch and "prefetch" or "fetch", #data, elapsed)
             return data
         end
+        local failure = requested and (status or code) or "request exception"
         log("page %d: %s FAILED after %d ms: %s",
-            index, is_prefetch and "prefetch" or "fetch", elapsed, tostring(status or code))
+            index, is_prefetch and "prefetch" or "fetch", elapsed, tostring(failure))
         logger.dbg("OPDSPSE:streamPages: Response headers:", headers)
-        return nil, status or code
+        return nil, tostring(failure or "request failed")
     end
 
     --- Tells the catalog which page the reader stopped on. Takes a source page,
@@ -1835,6 +1859,7 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
         end
         -- {pageNumber} is zero-based; the source page handed in is not.
         local page_url = remote_url:gsub("{pageNumber}", tostring(page - 1))
+        page_url = page_url:gsub("{maxWidth}", tostring(Screen:getWidth()))
         local parsed = url.parse(page_url)
         if parsed.scheme ~= "http" and parsed.scheme ~= "https" then
             log("progress: page %d not reported, invalid protocol %s",
@@ -1853,35 +1878,42 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
             return
         end
 
-        -- The body is discarded: what is wanted is the side effect on the
-        -- server, and there is no way to ask for that on its own.
-        local body = {}
-        socketutil:set_timeout(PROGRESS_BLOCK_TIMEOUT, PROGRESS_TOTAL_TIMEOUT)
-        local started = now()
-        -- Not `local _, ...` for the headers: in this file `_` is gettext, and
-        -- shadowing it inside a function is the trap documented at page_table.
-        local code, headers, status = socket.skip(1, http.request {
-            url         = page_url,
-            headers     = {
-                ["Accept-Encoding"] = "identity",
-            },
-            -- table_sink rather than ltn12.sink.table, which ignores the total
-            -- timeout: with a bare sink only the per-read block timeout applies
-            -- and it restarts on every chunk, so a server dribbling the image
-            -- slowly would hold the UI thread for as long as it liked.
-            sink        = socketutil.table_sink(body),
-            user        = username,
-            password    = password,
-        })
-        socketutil:reset_timeout()
-        if code == 200 then
-            log("progress: reported page %d in %d ms", page, elapsedMs(started))
+        local queued, reason = worker.progress_queue:submit(worker.progress_session, function()
+            if not require("ui/network/manager"):isConnected() then return "offline" end
+            socketutil:set_timeout(PROGRESS_BLOCK_TIMEOUT, PROGRESS_TOTAL_TIMEOUT)
+            -- Retain at most one chunk while keeping socketutil's total timeout.
+            -- Only a small status crosses the pipe, never the discarded image.
+            local body, received = {}, 0
+            local sink = socketutil.table_sink(body)
+            local requested, result, code, headers = pcall(http.request, {
+                url = page_url,
+                headers = {["Accept-Encoding"] = "identity"},
+                sink = function(chunk, err)
+                    local ok, failure = sink(chunk, err)
+                    body[1] = nil
+                    received = received + (chunk and #chunk or 0)
+                    return ok, failure
+                end,
+                user = username,
+                password = password,
+            })
+            socketutil:reset_timeout()
+            local expected = headers and tonumber(headers["content-length"])
+            if requested and result and code == 200 and (not expected or expected == received) then
+                return "ok"
+            end
+            return "request failed"
+        end, function(result, failure, timing)
+            if result == "ok" then
+                log("progress: reported page %d in %d ms (background)", page, timing.total_ms)
+            else
+                log("progress: page %d NOT reported (background): %s", page, tostring(failure or result))
+            end
+        end)
+        if queued then
+            log("progress: queued page %d for background report", page)
         else
-            -- Not worth a notification: the reader has left the chapter and
-            -- cannot act on it, and the next close carries a better position.
-            log("progress: page %d NOT reported after %d ms: %s",
-                page, elapsedMs(started), tostring(status or code))
-            logger.dbg("OPDSPSE:reportProgress: Response headers:", headers)
+            log("progress: page %d not queued: %s", page, tostring(reason))
         end
     end
 
@@ -1900,12 +1932,60 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
             cacheStore(index, data)
             return data, "disk"
         end
+        -- Foreground misses take priority over speculative network work.
+        worker:cancel()
         data = fetchPageData(index, is_prefetch)
         if data then
             cacheStore(index, data)
             diskCachePut(pageKey(index), data)
         end
         return data, data and "net" or nil
+    end
+
+    local function renderPageData(data, index, half, rotated)
+        local Image = require("opdsforcomic_image")
+        prefetch_state.decode_failures = prefetch_state.decode_failures or {}
+        local failures = prefetch_state.decode_failures
+        local previous = failures[index]
+        if previous and now() < previous.retry_at then return nil, false, previous.kind end
+        local reclaimed = false
+        local function reclaim()
+            worker:cancel()
+            dropStash()
+            collectgarbage("collect")
+            reclaimed = true
+            log("page %d: released decoded cache before allocation", index)
+        end
+        if Image.isLarge(data) then reclaim() end
+        local function attempt()
+            local ok, bb, spread, failure = pcall(renderSlot, data, index, half, rotated,
+                crop_cache, half_crop_cache, stashHalf)
+            if ok then return bb, spread, failure end
+            local kind, detail = Image.errorKind(bb)
+            log("page %d: render failed (%s): %s", index, kind, tostring(detail))
+            return nil, false, kind
+        end
+        local bb, spread, failure = attempt()
+        if not bb and failure == "memory" and not reclaimed then
+            reclaim()
+            bb, spread, failure = attempt()
+        end
+        if bb then
+            failures[index] = nil
+        elseif failure == "decode" then
+            -- Only invalid image data justifies downloading the bytes again.
+            failures[index] = nil
+            cacheDrop(index)
+        else
+            failure = failure or "render"
+            failures[index] = {kind = failure, retry_at = now() + 10}
+            if failure == "memory" then
+                prefetch_state.memory_until = now() + 10
+                collectgarbage("collect")
+            end
+            log("page %d: keeping raw image after %s failure; retry cooldown 10 s", index, failure)
+        end
+        return bb, spread, failure
     end
 
     local page_table = {image_disposable = true}
@@ -1936,7 +2016,7 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
         -- whenever the split is switched on.
         local wanted = dualPageOn() and spreadPages(key, count) or { src }
 
-        local function placeholder(label)
+        local function placeholder(label, failure)
             -- Failures are deliberately not cached, so turning away and back
             -- retries instead of showing the placeholder forever. Tell the
             -- reader what happened, throttled so a run of failures is not a
@@ -1944,8 +2024,13 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
             log("%s: no data, showing placeholder", label)
             if os.time() - last_failure_notice > 20 then
                 last_failure_notice = os.time()
-                Notification:notify(
-                    T(_("Page %1 failed to load. Turn the page and back to retry."), key),
+                Notification:notify(failure == "memory"
+                    and L("Not enough memory for this image. Wait 10 seconds, then turn back to retry.",
+                        "图片内存不足，请等 10 秒后翻回此页重试。")
+                    or failure == "budget"
+                    and L("This image exceeds the low-memory budget. Use a smaller source image.",
+                        "此图片超出省内存解码预算，请先缩小源图片。")
+                    or T(_("Page %1 failed to load. Turn the page and back to retry."), key),
                     Notification.SOURCE_ALWAYS_SHOW)
             end
             return RenderImage:renderImageFile("resources/koreader.png", false)
@@ -1989,12 +2074,11 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
                     return placeholder("page " .. page)
                 end
                 source = source or from
-                bb, is_spread = renderSlot(data, index, half, rotated,
-                    crop_cache, half_crop_cache, stashHalf)
+                local failure
+                bb, is_spread, failure = renderPageData(data, index, half, rotated)
                 if not bb then
-                    cacheDrop(index)
                     for _, done in ipairs(bbs) do done:free() end
-                    return placeholder("page " .. page)
+                    return placeholder("page " .. page, failure)
                 end
             end
             spread = is_spread
@@ -2028,7 +2112,7 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
             -- `src` is a 1-based viewer page while the stash is keyed like the
             -- caches, hence the -1.
             if not spread and source ~= "stash" and not dualPageOn() then
-                local kept = copyBlitbuffer(bbs[1])
+                local kept = copyBlitbuffer(bbs[1], true)
                 if kept then stashPage(src - 1, kept) end
             end
             displayed_source = src
@@ -2043,8 +2127,10 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
         local w1, h1 = bbs[1]:getWidth(), bbs[1]:getHeight()
         local w2, h2 = bbs[2]:getWidth(), bbs[2]:getHeight()
         local Blitbuffer = require("ffi/blitbuffer")
-        local composite = Blitbuffer.new(w1 + w2, math.max(h1, h2), bbs[1]:getType())
-        if composite then
+        local composite
+        local stitched, stitch_error = pcall(function()
+            composite = Blitbuffer.new(w1 + w2, math.max(h1, h2), bbs[1]:getType())
+            if not composite then return end
             if rtlReading() then
                 composite:blitFrom(bbs[2], 0, 0, 0, 0, w2, h2)
                 composite:blitFrom(bbs[1], w2, 0, 0, 0, w1, h1)
@@ -2052,12 +2138,15 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
                 composite:blitFrom(bbs[1], 0, 0, 0, 0, w1, h1)
                 composite:blitFrom(bbs[2], w1, 0, 0, 0, w2, h2)
             end
-        end
+        end)
         -- The source buffers are dead weight once stitched. Freeing them here
         -- keeps the peak at three buffers instead of holding all of them.
         for _, done in ipairs(bbs) do done:free() end
-        if not composite then
-            return placeholder("spread " .. key)
+        if not stitched or not composite then
+            if composite then composite:free() end
+            local failure = require("opdsforcomic_image").errorKind(stitch_error)
+            log("spread %d: composition failed (%s)", key, failure)
+            return placeholder("spread " .. key, failure)
         end
 
         displayed_source = wanted[#wanted]
@@ -2096,6 +2185,10 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
         with_title_bar = false,
         image_disposable = false, -- instead set page_table image_disposable to true
         images_list_nb = slotCount(),
+        _new_image_wg = function(this)
+            ImageViewer._new_image_wg(this)
+            Perf.prepareWidget(this._image_wg, log, now)
+        end,
     }
     -- The constructor can auto-rotate, changing split slots back to whole pages.
     initial_slot = firstSlotOfSource(resume_source)
@@ -2298,7 +2391,7 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
         local current = viewer._images_list_cur
         if not current then return end
         viewer._images_list_cur = nil -- defeat switchToImageNum's no-op check
-        viewer:switchToImageNum(current)
+        viewer:switchToImageNum(current, true)
     end
 
     --- The source page the reader is looking at right now, under whatever
@@ -2521,13 +2614,13 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
     -- server from being hammered.
     local schedulePrefetch
     local function prefetchNext()
-        if closed then return end
-        -- Cheap link check before anything else. DNS resolution sits outside
-        -- every socket timeout in this file and measured 20 s on this device,
-        -- so a fetch launched with no link is not a failed request but a frozen
-        -- UI thread. isConnected() is a sysfs read plus an getifaddrs walk and
-        -- costs nothing to ask. Deliberately not isOnline(), which is a DNS
-        -- query of its own -- the very cost being avoided (see reportProgress).
+        if closed or worker.job or prefetch_state.disabled then return end
+        if prefetch_state.memory_until and now() < prefetch_state.memory_until then
+            schedulePrefetch(prefetch_state.memory_until - now())
+            return
+        end
+        -- Use the cheap link check. isOnline() performs DNS on this UI thread;
+        -- DNS for the image request itself belongs in the bounded child process.
         local NetworkMgr = require("ui/network/manager")
         if not NetworkMgr:isConnected() then
             log("prefetch: no link, staying idle")
@@ -2539,13 +2632,10 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
         -- already known to be bad is what turned four slow requests into 91
         -- seconds of unresponsive UI in one measured session.
         if now() < prefetch_gate_until then
+            schedulePrefetch(prefetch_gate_until - now())
             return
         end
-        -- The fetch below is a synchronous HTTP request: it owns the UI thread
-        -- for its whole duration, so anything the reader touches meanwhile just
-        -- queues up. That is exactly the wrong time to hold the thread when a
-        -- dialog is open — the reader is looking at a button, not at the page.
-        -- Stand aside until the viewer is on top again.
+        -- Avoid launching speculative work while a dialog is on top.
         local stack = UIManager._window_stack
         local top = stack and stack[#stack]
         if viewer and top and top.widget ~= viewer then
@@ -2575,58 +2665,62 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
         -- A page already on disk needs no prefetch: it will load quickly
         -- enough on demand, and re-downloading it would waste the network we
         -- are trying to spare.
-        local function needed(index)
-            return index >= 0 and index < count
-                and cache[index] == nil
-                and not diskCacheHas(pageKey(index))
-        end
-        local target
-        for offset = 1, ahead do
-            if needed(base + offset) then
-                target = base + offset
-                break
-            end
-        end
-        if target == nil then
-            for offset = 1, behind do
-                if needed(base - offset) then
-                    target = base - offset
-                    break
-                end
-            end
-        end
+        local target = Perf.prefetchTarget(cache, base, count, ahead, behind,
+            prefetch_state.direction, MEM_CACHE_MAX_BYTES,
+            function(index) return diskCacheHas(pageKey(index)) end)
         if target == nil then return end
-        local data = fetchPageData(target, true)
-        if data then
-            cacheStore(target, data, true)
-            diskCachePut(pageKey(target), data)
-            if cache[target] == nil then
-                -- Stored and evicted in the same breath: the look-ahead window
-                -- does not fit in the memory cache. Carrying on would refetch
-                -- the same pages forever, so stop and let page turns re-arm.
-                log("prefetch window exceeds memory cache (%d bytes), stopping chain",
-                    cache_bytes)
-                return
-            end
-            schedulePrefetch(PREFETCH_CHAIN_DELAY)
-        else
-            -- Counted towards the circuit break above. A lone failure costs
-            -- nothing extra: the gate only refuses future launches. A success
-            -- deliberately does *not* clear the record any more -- see the note
-            -- on prefetch_fail_times.
-            local t = now()
-            local kept = {}
-            for i = 1, #prefetch_fail_times do
-                if t - prefetch_fail_times[i] < PREFETCH_FAIL_WINDOW then
-                    kept[#kept + 1] = prefetch_fail_times[i]
+        local launched, launch_reason = worker:start(target, fetchPageData, function(data, reason, timing)
+            if closed then return end
+            if data then
+                if not cacheStore(target, data, true) then
+                    log("prefetch: page %d no longer fits, stopping chain", target)
+                    return
+                end
+                diskCachePut(pageKey(target), data)
+                log("prefetch: page %d received in parent (%d bytes)", target, #data)
+                if timing then
+                    log("prefetch: page %d timing: fetch %d ms, handoff %d ms, total %d ms",
+                        target, timing.fetch_ms or 0, timing.transfer_ms or 0, timing.total_ms)
+                end
+                schedulePrefetch(PREFETCH_CHAIN_DELAY)
+            else
+                log("prefetch: page %d worker failed (%s)", target, tostring(reason))
+                -- Counted towards the circuit break above. A lone failure costs
+                -- nothing extra: the gate only refuses future launches. A success
+                -- deliberately does *not* clear the record any more -- see the note
+                -- on prefetch_fail_times.
+                local t = now()
+                local kept = {}
+                for i = 1, #prefetch_fail_times do
+                    if t - prefetch_fail_times[i] < PREFETCH_FAIL_WINDOW then
+                        kept[#kept + 1] = prefetch_fail_times[i]
+                    end
+                end
+                kept[#kept + 1] = t
+                prefetch_fail_times = kept
+                if #prefetch_fail_times >= PREFETCH_FAIL_MAX then
+                    prefetch_gate_until = t + PREFETCH_COOLDOWN
+                    log("prefetch: %d failures in %d s, standing down for %d s",
+                        #prefetch_fail_times, PREFETCH_FAIL_WINDOW, PREFETCH_COOLDOWN)
                 end
             end
-            kept[#kept + 1] = t
-            prefetch_fail_times = kept
-            if #prefetch_fail_times >= PREFETCH_FAIL_MAX then
-                prefetch_gate_until = t + PREFETCH_COOLDOWN
-                log("prefetch: %d failures in %d s, standing down for %d s",
-                    #prefetch_fail_times, PREFETCH_FAIL_WINDOW, PREFETCH_COOLDOWN)
+        end)
+        if not launched then
+            if launch_reason == "unsupported" or launch_reason == "closed" then
+                prefetch_state.disabled = true
+                log("prefetch: disabled (%s)", launch_reason)
+            else
+                prefetch_state.launch_failures = math.min((prefetch_state.launch_failures or 0) + 1, 5)
+                local delay = math.min(30, 2 ^ prefetch_state.launch_failures)
+                prefetch_gate_until = math.max(prefetch_gate_until, now() + delay)
+                log("prefetch: start failed (%s), retry in %d s", tostring(launch_reason), delay)
+                schedulePrefetch(delay)
+            end
+        else
+            prefetch_state.launch_failures = 0
+            if not prefetch_state.progress_flag_logged and remote_url:match("[?&]updateProgress=[^&]*") then
+                prefetch_state.progress_flag_logged = true
+                log("prefetch: updateProgress forced to false, page turns stay authoritative")
             end
         end
     end
@@ -2639,7 +2733,9 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
 
     -- Re-arm the look-ahead on every page turn, including the initial one.
     local orig_switch_to_image_num = viewer.switchToImageNum
-    viewer.switchToImageNum = function(this, image_num)
+    viewer.switchToImageNum = function(this, image_num, reloading)
+        local previous = sourceOfSlot((reloading and image_num or this._images_list_cur) or 1)
+        local turn_started = now()
         orig_switch_to_image_num(this, image_num)
         -- Learning a single sheet on a backward turn may have collapsed its
         -- requested second slot. Retry and prefetch must follow the actual one.
@@ -2650,8 +2746,18 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
         -- under the split -- and the caches are keyed by source page, so map
         -- across before looking anything up.
         local src = sourceOfSlot(image_num or 1)
+        if not reloading and src and previous and src ~= previous then
+            local direction = src > previous and 1 or -1
+            if direction ~= prefetch_state.direction or math.abs(src - previous) > PREFETCH_AHEAD then
+                worker:cancel()
+            end
+            prefetch_state.direction = direction
+        end
+        log("%s: source %s -> %s, prepared in %d ms", reloading and "redraw" or "turn",
+            tostring(previous), tostring(src), elapsedMs(turn_started))
         local index = src and (src - 1) or -1
-        if index >= 0 and cache[index] == nil and not retried[index] then
+        if index >= 0 and cache[index] == nil and not retried[index]
+            and not (prefetch_state.decode_failures and prefetch_state.decode_failures[index]) then
             retried[index] = true
             UIManager:scheduleIn(2.5, function()
                 if closed or viewer._images_list_cur ~= image_num then return end
@@ -2668,6 +2774,7 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
     local orig_on_close_widget = viewer.onCloseWidget
     viewer.onCloseWidget = function(this, ...)
         closed = true
+        worker:close()
         UIManager:unschedule(prefetchNext)
         -- Left-handed hold flips the whole screen; the file manager does not
         -- want to inherit that, so the rotation the chapter was opened in is
@@ -2689,10 +2796,8 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
         -- The stash holds a buffer, not a box, so it has to be let go by hand
         -- rather than dropped with the two tables above.
         dropStash()
-        -- Deferred: onCloseWidget runs inside the close, and the report is a
-        -- synchronous request that owns the UI thread for as long as it takes.
-        -- A beat later the browser is already on screen and a hitch is just a
-        -- hitch. Explicitly not guarded on `closed`, which is true by now.
+        -- Queue after closing; the report itself runs off the UI thread.
+        -- Not guarded on `closed`: this chapter still owns its final position.
         UIManager:scheduleIn(PROGRESS_REPORT_DELAY, function()
             reportProgress(last_source)
         end)
@@ -2924,7 +3029,8 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
         viewer.button_table,
     }
 
-    if viewer.rotated then
+    if viewer.rotated and (splitOn() or dualPageOn()
+        or (G_reader_settings:isTrue(AUTOCROP_KEY) and crop_cache[resume_source - 1] ~= false)) then
         reloadCurrentPage("initial automatic rotation")
     else
         -- Refresh the progress bar and replaced controls using the decoded image.
