@@ -5,6 +5,8 @@ An OPDS client for KOReader: read comics from a server, with page prefetching, t
 
 **语言 / Language:** [中文](#中文) · [English](#english)
 
+**当前源码版本 / Current source version: 0.1.5**（2026-10-08）
+
 ---
 
 <a id="screenshots"></a>
@@ -30,11 +32,20 @@ Kobo 墨水屏实机，点图看原图 · on a Kobo, tap an image for the full s
 
 ## 中文
 
+### 0.1.5 更新内容
+
+- **修复回翻重复**：开启“拆开双页扫描”后，从中间续读或跳页，再回翻到尚未识别的单页源图时，每次点击正确退一页，不再出现 `5 → 4 → 4 → 3 → 3`。真正双页扫描的两个半页仍各占一屏。
+- **续读直接加载目标页**：打开章节时先加载记录的源页，减少先取首页再跳转的重复工作；同步校正自动旋转后的页码与初始进度条。
+- **双页末尾与进度修正**：“首页单独显示”开启时，偶数源页章节不再漏掉末页；关闭阅读器时按最后成功显示的源页上报，双页画面取后一张源页。
+- **缓存与首次调色更稳**：整页、半页解码缓存合计保留量限制为 64 MiB；远跳加载按目标源页淘汰压缩数据缓存；修复重启后首次调色的颜色空间初始化。
+- **目录和邻章读取优化**：目录改用 GET，并在服务器支持时利用 ETag / Last-Modified 条件请求；需要相邻章节时补取后续目录分页，减少已加载列表边界导致的邻章缺失。
+- **下载失败和取消处理**：先写临时文件，检查响应长度（服务器提供时）后再替换目标文件；失败保留原文件，取消后未确认完成的任务保留。下载保留单次网络等待时限，不限制总传输时长。
+
 ### 功能
 
 从 OPDS 服务器（Suwayomi、Komga）直接看漫画，不用先下载到本地。派生自 KOReader 内置的 `opds.koplugin`，两者可同时启用。
 
-- **翻页不看转圈**：提前抓取后续页；内存缓存 16 MB，可选磁盘缓存（默认关，上限 64 MB）。
+- **页面预取与缓存**：提前抓取后续页；压缩数据内存缓存目标 16 MiB，解码后的整页、半页缓存合计最多保留 64 MiB；可选磁盘缓存默认关闭，上限 64 MiB。缓存预算不代表进程内存峰值。
 - **图标工具栏**：底部一排图标按钮（适屏 / 旋转 / 跳页 / 裁剪 / 明暗 / 关闭），和 KOReader 自带阅读器一样。
 - **明暗调节**：扫描发白或太暗时一键调整——0.5 ~ 0.9 提亮（步长 0.1）、**1.0 原样**、2 ~ 10 加深（步长 1.0）。JPEG / PNG / GIF / WebP / SVG 都支持。
 - **前光面板**：长按工具栏的「明暗」打开设备前光——亮度、暖光（设备支持时），带可调色温 LED 的机型还多一项色温配置。面板是 KOReader 自己的，各项按机型能力显示；没有前光的设备上这个长按不生效。
@@ -44,7 +55,7 @@ Kobo 墨水屏实机，点图看原图 · on a Kobo, tap an image for the full s
 - **Suwayomi 章节直读**：点章节名直接进阅读器，省掉中间的元数据页和下载对话框——每章少两次点击。
 - **章节导航**：读到章末再往后翻，直接问你要不要开下一章，**章节名一并列出**；底部工具栏长按「跳页」看前后各 5 章。
 - **实体翻页键**：支持设备自身的翻页键；配合下面的遥控项目，还可以用手机遥控翻页、旋转和全刷。
-- **续读位置准确**：退出再进来落在你停下的那一页（0.1.1 修）。
+- **直接续读**：打开章节时优先加载记录的源页；拆页按源图保存进度，不保证恢复到同一半页。
 
 ### 配套：手机遥控翻页
 
@@ -58,11 +69,11 @@ Kobo 墨水屏实机，点图看原图 · on a Kobo, tap an image for the full s
 
 ### 安装
 
-1. 从 [Releases](https://github.com/hugo1120/opdsforcomic.koplugin/releases) 下载 `opdsforcomic.koplugin.zip`，解压出 `opdsforcomic.koplugin` 文件夹。
+1. 下载[当前源码 ZIP](https://github.com/hugo1120/opdsforcomic.koplugin/archive/refs/heads/main.zip)，解压后将 `opdsforcomic.koplugin-main` 文件夹改名为 `opdsforcomic.koplugin`。
 2. 整个文件夹放进 KOReader 的 `plugins/`：Kobo `.adds/koreader/plugins/`，Kindle `koreader/plugins/`，Android `/sdcard/koreader/plugins/`，桌面 `~/.config/koreader/plugins/`。
 3. 完全退出 KOReader 再启动。
 
-> 从源码仓库下载的话，文件夹会叫 `opdsforcomic.koplugin-main`，要改名为 `opdsforcomic.koplugin`。
+> 也可从 [Releases](https://github.com/hugo1120/opdsforcomic.koplugin/releases) 获取预打包版本，以对应 Release 标签为准；当前源码的更新不代表已上传同版本的 Release 安装包。
 
 ### 使用
 
@@ -81,9 +92,9 @@ Kobo 墨水屏实机，点图看原图 · on a Kobo, tap an image for the full s
 
 **③ 阅读**：点屏幕**中间三分之一**唤出底部图标工具栏：适屏 / 旋转 / 跳页 / 裁剪 / 明暗 / 关闭。**长按「旋转」**打开显示面板（双页、拆页、从右到左、封面单屏）；**长按「跳页」**打开章节导航（前后各 5 章，当前章标「正在阅读」）；**长按「明暗」**打开设备前光面板（亮度、暖光，有的话）。「从右到左」默认开启，左开本漫画在面板里关掉。
 
-**拆页**：有些资源把跨页存成一张横图，打开拆页后按中线切开，两页各占一屏；跳页和页码仍按服务器原始页号。已知短板：扫描时就转了 90° 的单页也是横的，会被切开，遇到只能关掉这个开关。
+**拆页**：有些资源把跨页存成一张横图，打开拆页后按中线切开，两页各占一屏。跳页面板与服务端进度使用原始源页号，底部进度条按实际显示屏数计算。拆页开关会保留到其他章节，识别为单页的源图仍完整显示一屏。已知短板：扫描时就转了 90° 的单页也可能被当成双页切开，遇到请关闭拆页。
 
-> 关闭阅读界面时，插件会把最新的页码补报给服务器一次，所以下次点开这一章会回到你停下的那一页。缓存命中率高时真实请求很少，这一补报是必要的——否则服务器不知道你读到哪了。
+> 关闭阅读界面时，插件按最后成功显示的源页补报进度；本次未前进时不额外上报。双页记录画面中后一张源页，拆页记录源图编号。补报用于让缓存命中时的阅读进度也能同步到服务器。
 
 ### 服务端
 
@@ -106,11 +117,20 @@ Kobo 墨水屏实机，点图看原图 · on a Kobo, tap an image for the full s
 
 ## English
 
+### Changes in 0.1.5
+
+- **Fix repeated pages when turning back**: with “Split two-page scans” enabled, resuming or jumping into a chapter and then turning back onto an unknown single-page image now takes one turn per page, instead of sequences such as `5 → 4 → 4 → 3 → 3`. Each half of a genuine spread still gets its own screen.
+- **Load the resume page directly**: open the recorded source page first, avoiding the extra first-page load. Correct the initial page position and progress bar after automatic rotation.
+- **Fix the last page and progress in two-page mode**: chapters with an even number of source pages retain their last page when “First page is cover” is enabled. Closing reports the last successfully displayed source page, using the latter source page of a two-page view.
+- **Improve caching and the first tone adjustment**: decoded whole pages and halves share a 64 MiB retention budget; foreground jumps evict compressed data relative to the target page. Initialize the color space before the first tone adjustment after restarting.
+- **Improve catalogs and chapter navigation**: use GET with ETag / Last-Modified conditional requests when supported. Fetch additional catalog pages when needed to find neighboring chapters beyond the loaded list.
+- **Handle interrupted downloads safely**: write a temporary file, check the response length when supplied, then replace the destination. Failures retain the original file and cancellation retains unconfirmed tasks. Downloads keep a timeout for individual network waits without limiting total transfer duration.
+
 ### Features
 
 Read comics straight from an OPDS server (Suwayomi, Komga) without downloading them first. A fork of KOReader's bundled `opds.koplugin`; both can be enabled at once.
 
-- **No spinner between pages**: the next pages are fetched ahead of you — 16 MB in RAM, plus an optional disk cache (off by default, 64 MB).
+- **Page prefetching and caching**: compressed data targets a 16 MiB RAM budget; decoded whole pages and halves retain up to 64 MiB in total. An optional disk cache is off by default and capped at 64 MiB. These budgets do not cap peak process memory.
 - **Icon toolbar**: a bottom row of icons (Scale / Rotate / Go to / Crop / Tone / Close), same style as KOReader's own readers.
 - **Tone**: fix washed-out or too-dark scans — 0.5 – 0.9 brightens (step 0.1), **1.0 untouched**, 2 – 10 darkens (step 1.0). JPEG / PNG / GIF / WebP / SVG.
 - **Frontlight panel**: long press `Tone` in the toolbar for the device's frontlight — brightness, warmth where the device has it, and a colour configuration on boards with adjustable-temperature LEDs. It is KOReader's own panel, so it shows only what the device actually reports; on a reader with no frontlight the long press does nothing.
@@ -120,7 +140,7 @@ Read comics straight from an OPDS server (Suwayomi, Komga) without downloading t
 - **Suwayomi chapters open straight into the reader**: tapping a chapter skips the metadata page and the download dialog — two taps fewer per chapter.
 - **Chapter navigation**: turning past a chapter's last page offers to carry on, **naming the chapter**; long press `Go to` in the toolbar for five chapters either way.
 - **Hardware page keys**, plus phone remote control of page turns, rotation and full refresh via the project below.
-- **Accurate resume**: closing and reopening a chapter lands on the page you stopped at (fixed in 0.1.1).
+- **Direct resume**: load the recorded source page first. Split mode saves progress by source image and may reopen on a different half of that image.
 
 ### Companion: phone remote control
 
@@ -134,11 +154,11 @@ Nothing to configure on the plugin side: install the remote app and put both on 
 
 ### Installation
 
-1. Download `opdsforcomic.koplugin.zip` from [Releases](https://github.com/hugo1120/opdsforcomic.koplugin/releases) and unzip — you get an `opdsforcomic.koplugin` folder.
+1. Download the [current source ZIP](https://github.com/hugo1120/opdsforcomic.koplugin/archive/refs/heads/main.zip), unzip it, and rename `opdsforcomic.koplugin-main` to `opdsforcomic.koplugin`.
 2. Move the whole folder into KOReader's `plugins/`: Kobo `.adds/koreader/plugins/`, Kindle `koreader/plugins/`, Android `/sdcard/koreader/plugins/`, desktop `~/.config/koreader/plugins/`.
 3. Quit KOReader completely and start it again.
 
-> If downloaded from the source repository, the folder unpacks as `opdsforcomic.koplugin-main` and must be renamed to `opdsforcomic.koplugin`.
+> Prebuilt packages are also available from [Releases](https://github.com/hugo1120/opdsforcomic.koplugin/releases); check the release tag for their version. Source updates do not imply that a matching release package has been uploaded.
 
 ### Usage
 
@@ -157,9 +177,9 @@ Nothing to configure on the plugin side: install the remote app and put both on 
 
 **③ Read**: tap the **middle third** of the screen for the bottom icon toolbar: Scale / Rotate / Go to / Crop / Tone / Close. **Long press Rotate** for the display panel (two pages, split, right to left, cover first); **long press the `Go to` icon** for the chapter navigator — five chapters either way, with the current one marked; **long press `Tone`** for the device's frontlight panel (brightness, warmth where available). "Right to left" is on by default; turn it off for left-bound books.
 
-**Split**: releases that store a spread as one landscape image are cut at the middle, so each page gets its own screen. `Go to` and the page counter keep the server's original page numbers. Known gap: a single page stored a quarter-turn rotated is also landscape and will be cut — turn the switch off for those.
+**Split**: a spread stored as one landscape image is cut at the middle, so each half gets its own screen. `Go to` and server progress use original source page numbers; the bottom progress bar counts display screens. The split setting persists across chapters, and images identified as single pages remain one whole screen. Known gap: a single page stored a quarter-turn rotated may also be identified as a spread; turn the switch off for those.
 
-> Closing the reader reports the latest page to the server once, so reopening that chapter comes back to where you stopped. With a high cache hit rate few real requests reach the server, which is exactly why that one report is needed — otherwise the server has no idea how far you got.
+> Closing the reader reports the last successfully displayed source page if you advanced during the session. Two-page mode reports the latter source page in the view; split mode reports the source image number. This also synchronizes progress when page turns use cached images.
 
 ### Server side
 

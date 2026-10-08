@@ -3,7 +3,6 @@ local http = require("socket.http")
 local InfoMessage = require("ui/widget/infomessage")
 local InputDialog = require("ui/widget/inputdialog")
 local logger = require("logger")
-local ltn12 = require("ltn12")
 local Notification = require("ui/widget/notification")
 local RenderImage = require("ui/renderimage")
 local Screen = require("device").screen
@@ -29,16 +28,13 @@ every page turn wait.
 
 This fork keeps pages either side of the current one ready:
 
-  * memory cache, raw image bytes, small and evicted oldest-first
-  * disk cache, so a chapter that was read once does not need the network
-    again after a restart or when navigating far back
-  * the next pages are fetched in the background while the reader is still
-    looking at the current page
+  * raw image bytes, evicting pages furthest from the current source page
+  * optional disk cache (disabled by default)
+  * scheduled synchronous prefetch while the reader is looking at a page
+  * decoded whole pages and halves with a shared 64 MiB stash budget
 
-Only raw bytes are cached, never decoded BlitBuffers. The ImageViewer owns
-and frees whatever buffer it is handed (see the page_table.image_disposable
-note in streamPages), so holding decoded buffers here would risk handing it
-an already-freed one.
+ImageViewer owns and frees every buffer handed to it. Stash hits return a
+private copy, so the cached original never becomes a freed viewer buffer.
 ]]
 
 --- Number of pages kept ready ahead of / behind the current page.
@@ -312,7 +308,7 @@ local function spreadCountOf(pages)
     if not dualPageOn() then return pages end
     if pages < 1 then return 0 end
     if dualCoverFirst() then
-        return 1 + math.floor((pages - 1) / 2)
+        return 1 + math.ceil((pages - 1) / 2)
     end
     return math.ceil(pages / 2)
 end
@@ -1036,6 +1032,8 @@ end
 --- (stride walked as given) and are being confirmed on device with this build.
 darkenBuffer = function(bb, gamma_value)
     if not bb then return nil end
+    local ctx = pseGammaContext()
+    if not ctx then return nil end
     local t = bb:getType()
     local colorspace, alpha
     if t == pse_blitbuffer.TYPE_BB8 then
@@ -1051,8 +1049,6 @@ darkenBuffer = function(bb, gamma_value)
             tostring(t)))
         return nil
     end
-    local ctx = pseGammaContext()
-    if not ctx then return nil end
     local pix = pse_lib.mupdf_new_pixmap_with_data(ctx, colorspace,
         bb:getWidth(), bb:getHeight(), nil, alpha, bb.stride,
         pse_ffi.cast("unsigned char*", bb.data))
@@ -1174,6 +1170,26 @@ local function bindExternalPageTurns(viewer, on_boundary)
     end
 end
 
+-- Both decoded caches share a byte budget; full-size RGB scans can be much
+-- larger than the usual pages. The viewer always owns a separate copy.
+function OPDSPSE:trimStash(halves, pages)
+    local total = 0
+    for _, list in ipairs({ halves, pages }) do
+        for _, entry in ipairs(list) do
+            total = total + entry.bb.stride * entry.bb.h
+        end
+    end
+    while total > 64 * 1024 * 1024 do
+        local half, page = halves[#halves], pages[#pages]
+        local list = halves
+        if not half or (page and page.used < half.used) then list = pages end
+        local entry = table.remove(list)
+        if not entry then break end
+        total = total - entry.bb.stride * entry.bb.h
+        entry.bb:free()
+    end
+end
+
 function OPDSPSE:getLastPage(remote_url, username, password)
     local last_page = 0
 
@@ -1287,7 +1303,7 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
     -- prefetch breaker's own line ("N failures in 60 s") is the other place a
     -- log says which of the two it came from. The label stays "perf-fixes" so
     -- the tooling that slices on it keeps working.
-    log("opening stream: %d pages [perf-fixes 2026-09-25]", count)
+    log("opening stream: %d pages [perf-fixes 0.1.5]", count)
 
     -- Raw image bytes, keyed by 0-based page index (ImageViewer page numbers
     -- are 1-based, so index == key - 1, as elsewhere in this file).
@@ -1296,6 +1312,11 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
     -- this forward declaration they would read a *global* named viewer, which
     -- is always nil — Lua locals only come into scope at their declaration.
     local viewer
+    local initial_slot = 1
+    local resume_source = 1
+    local stash_clock = 0
+    local displayed_source
+    local pending_slot
 
     local cache = {}
     local cache_bytes = 0
@@ -1438,12 +1459,14 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
         -- halfRect puts side 1 on the right in a right-to-left book, so the same
         -- key stands for the opposite half once the reader flips the setting --
         -- and a cut buffer cannot be re-cut, only re-decoded.
-        table.insert(stash_entries, 1, { key = key, bb = bb, rtl = rtlReading() })
+        stash_clock = stash_clock + 1
+        table.insert(stash_entries, 1, { key = key, bb = bb, rtl = rtlReading(), used = stash_clock })
         while #stash_entries > STASH_DEPTH do
             local evicted = table.remove(stash_entries)
             log("stash: evict key %d, %d kept", evicted.key, #stash_entries)
             evicted.bb:free()
         end
+        self:trimStash(stash_entries, page_stash)
     end
 
     --- A private copy of the stashed half, or nil. The copy is not decoration:
@@ -1470,6 +1493,8 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
                 -- single turn past put here. Only the ordering changes -- the
                 -- entry stays in the stash, and the caller gets a copy.
                 table.remove(stash_entries, i)
+                stash_clock = stash_clock + 1
+                entry.used = stash_clock
                 table.insert(stash_entries, 1, entry)
                 return copyBlitbuffer(entry.bb)
             end
@@ -1499,8 +1524,10 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
                 table.remove(page_stash, i)
             end
         end
+        stash_clock = stash_clock + 1
         table.insert(page_stash, 1, {
             index = index, bb = bb,
+            used = stash_clock,
             -- The two settings that decide what "this page" is a picture of, and
             -- they have to travel with the buffer because neither can be undone
             -- in place: cropping is skipped while the view is rotated, and the
@@ -1516,6 +1543,7 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
             log("stash: evict whole page %d, %d kept", evicted.index, #page_stash)
             evicted.bb:free()
         end
+        self:trimStash(stash_entries, page_stash)
     end
 
     --- A private copy of the stashed whole page, or nil. Spelled out rather than
@@ -1543,6 +1571,8 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
                 -- turn past put here. Only the ordering changes; the caller gets
                 -- a copy.
                 table.remove(page_stash, i)
+                stash_clock = stash_clock + 1
+                entry.used = stash_clock
                 table.insert(page_stash, 1, entry)
                 return copyBlitbuffer(entry.bb)
             end
@@ -1598,10 +1628,9 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
         return nil, nil
     end
 
-    --- The first display slot of a source page. Learning what a page holds
-    --- never moves this number -- it counts only the pages *before* it -- and
-    --- that is what makes it safe to fill `slots` in while a page is on screen,
-    --- mid-read, with no re-anchoring.
+    --- The first display slot of a source page. Learning what this page holds
+    --- never moves its first slot: only the pages before it are counted.
+    --- A second slot that disappears must still be re-anchored to this one.
     local function firstSlotOfSource(page)
         if not splitActive() then return spreadOfPage(page) end
         local n = 1
@@ -1609,11 +1638,9 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
         return n
     end
 
-    --- Records what a decoded sheet turned out to hold. Called only while that
-    --- sheet's *first* slot is being drawn, the one position where its own slot
-    --- index cannot move under the reader (see firstSlotOfSource). Every slot
-    --- after it shifts, so the page counter has to be refreshed -- but the
-    --- reader does not, since they are already looking at the right page.
+    --- Records what a decoded sheet holds, including one first reached while
+    --- turning backwards. The render path re-anchors a disappearing second
+    --- slot before ImageViewer updates the page counter.
     local function learnSlots(page, n)
         if slots[page] == n then return end
         slots[page] = n
@@ -1634,7 +1661,12 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
     --- backwards second, so evicting oldest-first would drop exactly the pages
     --- the reader is about to need and keep the ones already behind them.
     --- MIN_PAGES keeps the cache usable even if one page exceeds the byte cap.
-    local function cacheEvict()
+    local function cacheEvict(current)
+        -- ImageViewer loads the new buffer before updating its current slot.
+        -- Foreground loads supply the target; prefetch uses the displayed page.
+        if current == nil then
+            current = viewer and ((sourceOfSlot(viewer._images_list_cur or 1) or 1) - 1) or 0
+        end
         while cache_bytes > MEM_CACHE_MAX_BYTES and cacheCount() > MEM_CACHE_MIN_PAGES do
             -- Distances are measured in 0-based source pages, because that is
             -- what the keys are. The viewer, however, counts display slots --
@@ -1643,10 +1675,6 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
             -- case. Feeding it straight in would measure every distance from a
             -- point behind the reader and so evict exactly the pages ahead of
             -- them, which is the opposite of the intent above.
-            local current = 0
-            if viewer then
-                current = (sourceOfSlot(viewer._images_list_cur or 1) or 1) - 1
-            end
             local worst, worst_dist
             for index, data in pairs(cache) do
                 local dist = math.abs(index - current)
@@ -1660,14 +1688,14 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
         end
     end
 
-    local function cacheStore(index, data)
+    local function cacheStore(index, data, is_prefetch)
         local previous = cache[index]
         if previous then
             cache_bytes = cache_bytes - #previous
         end
         cache[index] = data
         cache_bytes = cache_bytes + #data
-        cacheEvict()
+        cacheEvict(not is_prefetch and index or nil)
     end
 
     local function cacheDrop(index)
@@ -1896,6 +1924,9 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
         if type(key) ~= "number" then
             return RenderImage:renderImageFile("resources/koreader.png", false)
         end
+        -- The stock constructor always asks for slot 1. Render the resume slot
+        -- instead and set its actual number immediately after construction.
+        if not viewer then key = initial_slot end
         local started = now()
         local rotated = isRotated()
         local src, half = sourceOfSlot(key)
@@ -1970,12 +2001,20 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
             bbs[#bbs + 1] = bb
         end
 
-        -- Remember what the sheet held, but only where the bookkeeping cannot
-        -- move under the reader: while its first slot is on screen (see
-        -- firstSlotOfSource). Skipped while rotated, where the split is off by
-        -- definition and every sheet would be recorded as holding one page.
-        if splitOn() and not rotated and key == firstSlotOfSource(src) then
+        -- A backward turn may first reach an unknown sheet's second slot.
+        -- Learn single pages there too, or both slots show the same whole page.
+        -- ImageViewer assigns its requested index *after* this lookup, so defer
+        -- the correction until update(), before it paints the page counter.
+        if splitOn() and not rotated then
             learnSlots(src, spread and 2 or 1)
+            if not spread then
+                local first_slot = firstSlotOfSource(src)
+                if key ~= first_slot then
+                    log("page %d: single sheet %d, remap to slot %d", key, src, first_slot)
+                    key = first_slot
+                    pending_slot = first_slot
+                end
+            end
         end
 
         if #bbs == 1 then
@@ -1992,6 +2031,7 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
                 local kept = copyBlitbuffer(bbs[1])
                 if kept then stashPage(src - 1, kept) end
             end
+            displayed_source = src
             log("page %d: ready in %d ms via %s as %dx%d%s", key,
                 elapsedMs(started), source, bbs[1]:getWidth(), bbs[1]:getHeight(),
                 spread and string.format(" (half %d of sheet %d)", half, src) or "")
@@ -2020,6 +2060,7 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
             return placeholder("spread " .. key)
         end
 
+        displayed_source = wanted[#wanted]
         log("spread %d (%s): ready in %d ms via %s as %dx%d", key,
             table.concat(wanted, ","), elapsedMs(started), source,
             composite:getWidth(), composite:getHeight())
@@ -2041,6 +2082,13 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
         G_reader_settings:saveSetting(DUAL_KEY, false)
     end
 
+    if not continue then
+        local resume = tonumber(last_page_read) or tonumber(last_page) or 0
+        resume = math.max(1, math.min(count, math.floor(resume) + 1))
+        resume_source = resume
+        initial_slot = firstSlotOfSource(resume)
+    end
+
     local ImageViewer = require("ui/widget/imageviewer")
     viewer = ImageViewer:new{
         image = page_table,
@@ -2049,6 +2097,9 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
         image_disposable = false, -- instead set page_table image_disposable to true
         images_list_nb = slotCount(),
     }
+    -- The constructor can auto-rotate, changing split slots back to whole pages.
+    initial_slot = firstSlotOfSource(resume_source)
+    viewer._images_list_cur = initial_slot
 
     -- Left-handed hold, applied here and not in the constructor: the flip is a
     -- screen-global rotation, so it must be taken down with the viewer, and
@@ -2059,11 +2110,9 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
         Screen:setRotationMode((viewer.orig_rotation_mode + INVERT_180) % 4)
     end
 
-    -- The constructor renders page one and *then* writes the count it was
-    -- given, which was counted before that page had been seen. So a split
-    -- chapter whose first sheet holds a single page is one out from the start.
-    -- Restate it now that page one has been measured; learnSlots keeps it
-    -- current from here on, and it only ever learns at a sheet's first slot.
+    -- The constructor writes the count it received before decoding the initial
+    -- source page. Recount after learning whether that page holds one or two
+    -- screens; learnSlots keeps the count current on subsequent page turns.
     viewer._images_list_nb = slotCount()
 
     -- A turn that could not move: the reader has run off the end of the chapter
@@ -2178,6 +2227,10 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
     local orig_update = viewer.update
     local orig_has_kaleido_wfm = Device.hasKaleidoWfm
     viewer.update = function(this, ...)
+        if pending_slot then
+            this._images_list_cur = pending_slot
+            pending_slot = nil
+        end
         Device.hasKaleidoWfm = function() return true end
         -- Restore before re-raising: the override must not outlive the call
         -- that needs it, whether that call succeeds or throws.
@@ -2545,7 +2598,7 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
         if target == nil then return end
         local data = fetchPageData(target, true)
         if data then
-            cacheStore(target, data)
+            cacheStore(target, data, true)
             diskCachePut(pageKey(target), data)
             if cache[target] == nil then
                 -- Stored and evicted in the same breath: the look-ahead window
@@ -2588,6 +2641,9 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
     local orig_switch_to_image_num = viewer.switchToImageNum
     viewer.switchToImageNum = function(this, image_num)
         orig_switch_to_image_num(this, image_num)
+        -- Learning a single sheet on a backward turn may have collapsed its
+        -- requested second slot. Retry and prefetch must follow the actual one.
+        image_num = this._images_list_cur
         -- A load that had to hit the network was a prefetch miss; retry it
         -- once shortly after, in case the failure was a transient timeout.
         -- image_num is a display slot -- a spread under dual-page, half a sheet
@@ -2625,7 +2681,9 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
         -- Read before anything is torn down: the slot-to-page mapping goes away
         -- with the viewer, and the number the catalog understands is the source
         -- page, not the slot.
-        local last_source = currentSourcePage()
+        -- Successful rendering records the last source in a pair. A placeholder
+        -- must not advance progress for a page that failed to load.
+        local last_source = displayed_source
         cache, cache_bytes = {}, 0
         crop_cache, half_crop_cache = {}, {}
         -- The stash holds a buffer, not a box, so it has to be let go by hand
@@ -2866,25 +2924,18 @@ function OPDSPSE:streamPages(remote_url, count, continue, username, password, la
         viewer.button_table,
     }
 
+    if viewer.rotated then
+        reloadCurrentPage("initial automatic rotation")
+    else
+        -- Refresh the progress bar and replaced controls using the decoded image.
+        viewer:update()
+    end
     UIManager:show(viewer)
     if continue then
         self:jumpToPage(viewer, count, currentSourcePage(), firstSlotOfSource)
-    elseif last_page_read then
-        -- last_page_read is the catalog's *zero-based page index*, not a source
-        -- page -- the same numbering the Kavita branch below uses, and the same
-        -- one reportProgress writes: it sends `page - 1`, and the server echoes
-        -- that value straight back as pse:lastRead and as the History feed's
-        -- "Progress: N of M" (both captured from the real server, and for the
-        -- same chapter they agree: 119 of 327 / pse:lastRead="119"). So it
-        -- needs the same +1, and the lack of it is why every resume used to
-        -- land one page before where the reader stopped. At the front of a
-        -- chapter that is indistinguishable from having no position at all:
-        -- read two pages, close, reopen, and page one comes back.
-        viewer:switchToImageNum(firstSlotOfSource(last_page_read + 1))
     else
-        -- add 1 since Kavita's Page count is zero based
-        -- and ImageViewer is not.
-        viewer:switchToImageNum(last_page+1)
+        -- No second render; the wrapper still arms prefetch and failure retry.
+        viewer:switchToImageNum(initial_slot)
     end
 
     -- Where the reader landed. Recorded after the jump above, so the close-time
@@ -3019,6 +3070,7 @@ function OPDSPSE:showChapterChooser(viewer, nav, forward, wide, total)
     -- in the boundary callback so that neither of them has to be the only thing
     -- standing between a nil and an index into it.
     if not nav then return end
+    if nav.ensure_neighbors then nav.ensure_neighbors(wide and 5 or 1) end
     local chapters, index = nav.chapters, nav.index
     if type(chapters) ~= "table" or not index then return end
 

@@ -21,8 +21,6 @@ local http = require("socket.http")
 local ffiUtil = require("ffi/util")
 local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
-local ltn12 = require("ltn12")
-local socket = require("socket")
 local socketutil = require("socketutil")
 local url = require("socket.url")
 local util = require("util")
@@ -30,7 +28,7 @@ local _ = require("gettext")
 local N_ = _.ngettext
 local T = ffiUtil.template
 
--- cache catalog parsed from feed xml
+-- Raw feeds and their HTTP validators, bounded to 20 catalogs.
 local CatalogCache = Cache:new{
     -- Make it 20 slots, with no storage space constraints
     slots = 20,
@@ -420,25 +418,11 @@ function OPDSBrowser:deleteCatalog(item)
     self._manager.updated = true
 end
 
---- How long a single feed request may take before it is abandoned, in seconds.
----
---- socketutil.LARGE_BLOCK_TIMEOUT is 10, and it is the *whole* budget for a try:
---- the total timeout set beside it is never enforced here, because the request
---- below uses a bare ltn12.sink.table rather than socketutil.table_sink, and
---- only the latter watches the clock (socketutil.lua:97-115). The block timeout
---- does apply, through http.TIMEOUT, which set_timeout also writes.
----
---- Ten seconds is far too long for what is being fetched. These are feeds —
---- chapter metadata, a series chapter list, the history list — all XML, two
---- orders of magnitude smaller than a page image, and the reader is sitting in
---- front of a frozen screen for every one of those seconds. The 2026-09-25 log
---- paid it in full eight times (11:29-11:30 and 13:44-13:46), each one also
---- raising a modal "cannot get catalog" that had to be dismissed. Five is still
---- generous for a few tens of kilobytes and halves the freeze.
+-- Bound each socket wait; table_sink also enforces the overall body deadline.
 local FEED_BLOCK_TIMEOUT = 5
 
 -- Fetches feed from server
-function OPDSBrowser:fetchFeed(item_url, headers_only)
+function OPDSBrowser:fetchFeed(item_url, headers_only, cached, quiet)
     local sink = {}
     socketutil:set_timeout(FEED_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT)
     local request = {
@@ -450,26 +434,33 @@ function OPDSBrowser:fetchFeed(item_url, headers_only)
             ["Accept-Encoding"] = "identity",
             ["Accept"] = self.opds20_feed, -- prefer OPDS 2.0
         },
-        sink     = ltn12.sink.table(sink),
+        sink     = socketutil.table_sink(sink),
         user     = self.root_catalog_username,
         password = self.root_catalog_password,
     }
+    if cached and not headers_only then
+        request.headers["If-None-Match"] = cached.etag
+        request.headers["If-Modified-Since"] = cached.last_modified
+    end
     logger.dbg("Request:", socketutil.redact_request(request))
-    local code, headers, status = socket.skip(1, http.request(request))
+    local ok, result, code, headers, status = pcall(http.request, request)
     socketutil:reset_timeout()
+    if not ok then code, headers, status = nil, nil, tostring(result) end
 
     if headers_only then
         return headers
     end
     if code == 200 then
         local xml = table.concat(sink)
-        return xml ~= "" and xml
+        return xml ~= "" and xml or nil, headers, code
+    elseif code == 304 and cached and cached.feed then
+        return cached.feed, headers, code
     end
 
     local text, icon
-    if headers and code == 301 then
+    if headers and headers.location and code == 301 then
         text = T(_("The catalog has been permanently moved. Please update catalog URL to '%1'."), BD.url(headers.location))
-    elseif headers and code == 302
+    elseif headers and headers.location and code == 302
         and item_url:match("^https")
         and headers.location:match("^http[^s]") then
         text = T(_("Insecure HTTPS → HTTP downgrade attempted by redirect from:\n\n'%1'\n\nto\n\n'%2'.\n\nPlease inform the server administrator that many clients disallow this because it could be a downgrade attack."),
@@ -484,34 +475,31 @@ function OPDSBrowser:fetchFeed(item_url, headers_only)
         }
         text = code and error_message[tostring(code)] or T(_("Cannot get catalog. Server response status: %1."), status or code)
     end
-    UIManager:show(InfoMessage:new{
-        text = text,
-        icon = icon,
-    })
+    if not quiet then
+        UIManager:show(InfoMessage:new{
+            text = text,
+            icon = icon,
+        })
+    end
     logger.dbg(string.format("OPDS: Failed to fetch catalog `%s`: %s", item_url, text))
 end
 
 -- Parses feed to catalog
-function OPDSBrowser:parseFeed(item_url)
-    local headers = self:fetchFeed(item_url, true)
-    local feed_last_modified = headers and headers["last-modified"]
-    local feed
-    if feed_last_modified then
-        local hash = "opds|catalog|" .. item_url .. "|" .. feed_last_modified
-        feed = CatalogCache:check(hash)
-        if feed then
-            logger.dbg("Cache hit for", hash)
-        else
-            logger.dbg("Cache miss for", hash)
-            feed = self:fetchFeed(item_url)
-            if feed then
-                logger.dbg("Caching", hash)
-                CatalogCache:insert(hash, feed)
-            end
-        end
-    else
-        feed = self:fetchFeed(item_url)
+function OPDSBrowser:parseFeed(item_url, quiet)
+    -- Credentials partition the cache without appearing in its diagnostic logs.
+    local key = item_url .. "\0" .. (self.root_catalog_username or "")
+        .. "\0" .. (self.root_catalog_password or "")
+    local cached = CatalogCache:check(key)
+    local feed, headers, code = self:fetchFeed(item_url, false, cached, quiet)
+    if feed and headers then
+        CatalogCache:insert(key, {
+            feed = feed,
+            etag = headers.etag or (code == 304 and cached and cached.etag or nil),
+            last_modified = headers["last-modified"]
+                or (code == 304 and cached and cached.last_modified or nil),
+        })
     end
+    if feed then feed = feed:gsub("^\239\187\191", ""):match("^%s*(.*)$") end
     local start = feed and feed:sub(1, 1)
     if start == "<" then -- OPDS 1.x
         return OPDSParser:parse(feed)
@@ -1288,37 +1276,56 @@ function OPDSBrowser:downloadFile(local_path, remote_url, username, password, ca
     logger.dbg("Downloading file", local_path, "from", remote_url)
     local code, headers, status
     local parsed = url.parse(remote_url)
-    if parsed.scheme == "http" or parsed.scheme == "https" then
-        socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT, socketutil.FILE_TOTAL_TIMEOUT)
-        code, headers, status = socket.skip(1, http.request {
-            url      = remote_url,
-            headers  = {
-                ["Accept-Encoding"] = "identity",
-            },
-            sink     = ltn12.sink.file(io.open(local_path, "w")),
-            user     = username,
-            password = password,
-        })
-        socketutil:reset_timeout()
+    -- Same directory keeps rename atomic on the Kobo filesystem. A failed or
+    -- cancelled transfer must never replace an existing complete download.
+    local partial_path = local_path .. ".opdsforcomic.part"
+    if parsed and (parsed.scheme == "http" or parsed.scheme == "https") then
+        local handle, open_err = io.open(partial_path, "wb")
+        if handle then
+            -- Whole books routinely take longer than one minute. Preserve the
+            -- per-read deadline and cancellation without imposing a body limit.
+            socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT, -1)
+            local ok, result
+            ok, result, code, headers, status = pcall(http.request, {
+                url      = remote_url,
+                headers  = { ["Accept-Encoding"] = "identity" },
+                sink     = socketutil.file_sink(handle),
+                user     = username,
+                password = password,
+            })
+            socketutil:reset_timeout()
+            -- The sink normally closes it; exceptions may leave it open.
+            pcall(handle.close, handle)
+            if not ok then code, headers, status = nil, nil, tostring(result) end
+        else
+            status = open_err
+        end
     else
-        UIManager:show(InfoMessage:new {
-            text = T(_("Invalid protocol:\n%1"), parsed.scheme),
-        })
+        status = T(_("Invalid protocol:\n%1"), parsed and parsed.scheme or "")
     end
     if code == 200 then
-        logger.dbg("File downloaded to", local_path)
-        if caller_callback then
-            caller_callback(local_path)
+        local attr = lfs.attributes(partial_path)
+        local expected = headers and tonumber(headers["content-length"])
+        if attr and attr.size > 0 and (not expected or attr.size == expected) then
+            local renamed, rename_err = os.rename(partial_path, local_path)
+            if renamed then
+                logger.dbg("File downloaded to", local_path)
+                if caller_callback then caller_callback(local_path) end
+                return true
+            end
+            status = rename_err
+        else
+            status = _("Incomplete download")
         end
-        return true
-    elseif code == 302 and remote_url:match("^https") and headers.location:match("^http[^s]") then
-        util.removeFile(local_path)
+    end
+    util.removeFile(partial_path)
+    if code == 302 and remote_url:match("^https") and headers and headers.location
+        and headers.location:match("^http[^s]") then
         UIManager:show(InfoMessage:new{
             text = T(_("Insecure HTTPS → HTTP downgrade attempted by redirect from:\n\n'%1'\n\nto\n\n'%2'.\n\nPlease inform the server administrator that many clients disallow this because it could be a downgrade attack."), BD.url(remote_url), BD.url(headers.location)),
             icon = "notice-warning",
         })
     else
-        util.removeFile(local_path)
         logger.dbg("OPDSBrowser:downloadFile: Request failed:", status or code)
         logger.dbg("OPDSBrowser:downloadFile: Response headers:", headers)
         UIManager:show(InfoMessage:new {
@@ -1552,7 +1559,20 @@ function OPDSBrowser:suwayomiChapterNav(item)
         end
     end
 
-    return { chapters = chapters, index = index, open = open, show_list = show_list }
+    if list_is_on_screen then
+        -- Seed the navigation cache from the already displayed catalog. Further
+        -- pages are fetched only when the chooser needs neighbours past its end.
+        self.suwayomi_series_cache = self.suwayomi_series_cache or {}
+        self.suwayomi_series_cache[series_url] = {
+            chapters = chapters, title = title, next_url = hrefs.next, pages = 1,
+        }
+    end
+    local nav = { chapters = chapters, index = index, open = open, show_list = show_list }
+    nav.ensure_neighbors = function(span)
+        local loaded, at = self:suwayomiSeriesChapters(item, series_url, span)
+        if loaded then nav.chapters, nav.index = loaded, at end
+    end
+    return nav
 end
 
 -- The chapters of `item`'s series, straight from the server's own chapter feed.
@@ -1577,26 +1597,34 @@ end
 -- else -- which is exactly what every chapter had before the feature existed.
 local SERIES_PAGE_LIMIT = 10
 
-function OPDSBrowser:suwayomiSeriesChapters(item, series_url)
+function OPDSBrowser:suwayomiSeriesChapters(item, series_url, neighbors)
     self.suwayomi_series_cache = self.suwayomi_series_cache or {}
     local series = self.suwayomi_series_cache[series_url]
     if not series then
         series = { chapters = {}, next_url = series_url, pages = 0 }
         self.suwayomi_series_cache[series_url] = series
     end
+    local found_index
     while true do
         -- What is already in hand, before asking for more: this is the common
         -- case on every visit after the first, because the walk stops as soon
         -- as it has the chapter and leaves the rest of the series unread.
         for index, entry in ipairs(series.chapters) do
             if entry.url == item.url then
-                return series.chapters, index, series.title
+                found_index = index
+                break
             end
+        end
+        if found_index and (#series.chapters - found_index >= (neighbors or 0)
+            or not series.next_url or series.pages >= SERIES_PAGE_LIMIT) then
+            return series.chapters, found_index, series.title
         end
         if not series.next_url or series.pages >= SERIES_PAGE_LIMIT then break end
 
         local url = series.next_url
-        local ok, catalog = pcall(self.parseFeed, self, url)
+        series.visited = series.visited or {}
+        if series.visited[url] then break end
+        local ok, catalog = pcall(self.parseFeed, self, url, true)
         -- A failure ends the walk but keeps what was already read, and leaves
         -- the page to be asked for again rather than remembered as empty.
         if not ok or not catalog then
@@ -1621,11 +1649,15 @@ function OPDSBrowser:suwayomiSeriesChapters(item, series_url)
         -- and search URL. The browser is still open underneath the reader and
         -- has to be handed back exactly as it was left, so those are put back.
         local title, facets, search = self.catalog_title, self.facet_groups, self.search_url
-        local menu_table = self:genItemTableFromCatalog(catalog, url)
+        local generated, menu_table = pcall(self.genItemTableFromCatalog, self, catalog, url)
         self.catalog_title, self.facet_groups, self.search_url = title, facets, search
+        if not generated then break end
+        local known = {}
+        for _, entry in ipairs(series.chapters) do known[entry.url] = true end
         for _, entry in ipairs(menu_table) do
-            if self.isSuwayomiChapterEntry(entry) then
+            if self.isSuwayomiChapterEntry(entry) and not known[entry.url] then
                 table.insert(series.chapters, entry)
+                known[entry.url] = true
             end
         end
         -- The one success line here, and it is deliberate: without it a wrong
@@ -1638,9 +1670,11 @@ function OPDSBrowser:suwayomiSeriesChapters(item, series_url)
             "Suwayomi series: fetched %d chapter(s), %d page(s) so far, from %s",
             #series.chapters, series.pages + 1, url))
         series.pages = series.pages + 1
+        series.visited[url] = true
         local hrefs = menu_table.hrefs
         series.next_url = type(hrefs) == "table" and hrefs.next or nil
     end
+    if found_index then return series.chapters, found_index, series.title end
     -- Not in anything that was read, for one of two different reasons, and the
     -- log has to tell them apart.
     if series.next_url then
@@ -1959,15 +1993,10 @@ function OPDSBrowser:downloadDownloadList()
         local item = self.downloads[i]
         if downloaded and downloaded[item.file] then
             table.remove(self.downloads, i)
-        else -- if subprocess has been interrupted, check for the downloaded file
-            local attr = lfs.attributes(item.file)
-            if attr then
-                if attr.size > 0 then
-                    table.remove(self.downloads, i)
-                else -- incomplete download
-                    os.remove(item.file)
-                end
-            end
+        elseif not completed then
+            -- File existence is not proof that this task completed: it could
+            -- be an older download. Keep unconfirmed jobs queued on cancellation.
+            util.removeFile(item.file .. ".opdsforcomic.part")
         end
     end
     dl_count = dl_count - #self.downloads
@@ -2265,27 +2294,20 @@ function OPDSBrowser:downloadPendingSyncs()
         end
         local dl_count = 0
         local dl_size = #dl_list
+        local duplicates = {}
+        for _, item in ipairs(duplicate_list or {}) do duplicates[item.file] = true end
         for i = dl_size, 1, -1 do
             local item = dl_list[i]
             if downloaded and downloaded[item.file] then
                 dl_count = dl_count + 1
                 table.remove(dl_list, i)
-            else -- if subprocess has been interrupted, check for the downloaded file
-                local attr = lfs.attributes(item.file)
-                if attr then
-                    if attr.size > 0 then
-                        table.remove(dl_list, i)
-                        if attr.modification > os.time() - 300 then -- Only count files touched in the last 5 mins
-                            dl_count = dl_count + 1
-                        end
-                    else -- incomplete download
-                        os.remove(item.file)
-                    end
-                end
+            elseif duplicates[item.file] then
+                table.remove(dl_list, i)
+            elseif not completed then
+                util.removeFile(item.file .. ".opdsforcomic.part")
             end
         end
         local duplicate_count = duplicate_list and #duplicate_list or 0
-        dl_count = dl_count - duplicate_count
         -- Make downloaded count timeout if there's a duplicate file prompt
         local timeout = nil
         if duplicate_count > 0 then
