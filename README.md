@@ -5,7 +5,7 @@ An OPDS client for KOReader: read comics from a server, with page prefetching, t
 
 **语言 / Language:** [中文](#中文) · [English](#english)
 
-**当前源码版本 / Current source version: 0.1.5**（2026-10-08）
+**当前版本 / Current version: [0.1.5](https://github.com/hugo1120/opdsforcomic.koplugin/releases/tag/0.1.5)**（2026-10-08）
 
 ---
 
@@ -32,14 +32,7 @@ Kobo 墨水屏实机，点图看原图 · on a Kobo, tap an image for the full s
 
 ## 中文
 
-### 0.1.5 更新内容
-
-- **修复回翻重复**：开启“拆开双页扫描”后，从中间续读或跳页，再回翻到尚未识别的单页源图时，每次点击正确退一页，不再出现 `5 → 4 → 4 → 3 → 3`。真正双页扫描的两个半页仍各占一屏。
-- **续读直接加载目标页**：打开章节时先加载记录的源页，减少先取首页再跳转的重复工作；同步校正自动旋转后的页码与初始进度条。
-- **双页末尾与进度修正**：“首页单独显示”开启时，偶数源页章节不再漏掉末页；关闭阅读器时按最后成功显示的源页上报，双页画面取后一张源页。
-- **缓存与首次调色更稳**：整页、半页解码缓存合计保留量限制为 64 MiB；远跳加载按目标源页淘汰压缩数据缓存；修复重启后首次调色的颜色空间初始化。
-- **目录和邻章读取优化**：目录改用 GET，并在服务器支持时利用 ETag / Last-Modified 条件请求；需要相邻章节时补取后续目录分页，减少已加载列表边界导致的邻章缺失。
-- **下载失败和取消处理**：先写临时文件，检查响应长度（服务器提供时）后再替换目标文件；失败保留原文件，取消后未确认完成的任务保留。下载保留单次网络等待时限，不限制总传输时长。
+更新记录见 [0.1.5 Release](https://github.com/hugo1120/opdsforcomic.koplugin/releases/tag/0.1.5)。
 
 ### 功能
 
@@ -69,11 +62,11 @@ Kobo 墨水屏实机，点图看原图 · on a Kobo, tap an image for the full s
 
 ### 安装
 
-1. 下载[当前源码 ZIP](https://github.com/hugo1120/opdsforcomic.koplugin/archive/refs/heads/main.zip)，解压后将 `opdsforcomic.koplugin-main` 文件夹改名为 `opdsforcomic.koplugin`。
+1. 从 [0.1.5 Release](https://github.com/hugo1120/opdsforcomic.koplugin/releases/tag/0.1.5) 下载 `opdsforcomic.koplugin.zip`，解压出 `opdsforcomic.koplugin` 文件夹。
 2. 整个文件夹放进 KOReader 的 `plugins/`：Kobo `.adds/koreader/plugins/`，Kindle `koreader/plugins/`，Android `/sdcard/koreader/plugins/`，桌面 `~/.config/koreader/plugins/`。
 3. 完全退出 KOReader 再启动。
 
-> 也可从 [Releases](https://github.com/hugo1120/opdsforcomic.koplugin/releases) 获取预打包版本，以对应 Release 标签为准；当前源码的更新不代表已上传同版本的 Release 安装包。
+> 也可下载[当前源码 ZIP](https://github.com/hugo1120/opdsforcomic.koplugin/archive/refs/heads/main.zip)，解压后将 `opdsforcomic.koplugin-main` 改名为 `opdsforcomic.koplugin`。
 
 ### 使用
 
@@ -117,14 +110,7 @@ Kobo 墨水屏实机，点图看原图 · on a Kobo, tap an image for the full s
 
 ## English
 
-### Changes in 0.1.5
-
-- **Fix repeated pages when turning back**: with “Split two-page scans” enabled, resuming or jumping into a chapter and then turning back onto an unknown single-page image now takes one turn per page, instead of sequences such as `5 → 4 → 4 → 3 → 3`. Each half of a genuine spread still gets its own screen.
-- **Load the resume page directly**: open the recorded source page first, avoiding the extra first-page load. Correct the initial page position and progress bar after automatic rotation.
-- **Fix the last page and progress in two-page mode**: chapters with an even number of source pages retain their last page when “First page is cover” is enabled. Closing reports the last successfully displayed source page, using the latter source page of a two-page view.
-- **Improve caching and the first tone adjustment**: decoded whole pages and halves share a 64 MiB retention budget; foreground jumps evict compressed data relative to the target page. Initialize the color space before the first tone adjustment after restarting.
-- **Improve catalogs and chapter navigation**: use GET with ETag / Last-Modified conditional requests when supported. Fetch additional catalog pages when needed to find neighboring chapters beyond the loaded list.
-- **Handle interrupted downloads safely**: write a temporary file, check the response length when supplied, then replace the destination. Failures retain the original file and cancellation retains unconfirmed tasks. Downloads keep a timeout for individual network waits without limiting total transfer duration.
+See the [0.1.5 Release](https://github.com/hugo1120/opdsforcomic.koplugin/releases/tag/0.1.5) for the changelog.
 
 ### Features
 
@@ -154,11 +140,11 @@ Nothing to configure on the plugin side: install the remote app and put both on 
 
 ### Installation
 
-1. Download the [current source ZIP](https://github.com/hugo1120/opdsforcomic.koplugin/archive/refs/heads/main.zip), unzip it, and rename `opdsforcomic.koplugin-main` to `opdsforcomic.koplugin`.
+1. Download `opdsforcomic.koplugin.zip` from the [0.1.5 Release](https://github.com/hugo1120/opdsforcomic.koplugin/releases/tag/0.1.5) and unzip it to get the `opdsforcomic.koplugin` folder.
 2. Move the whole folder into KOReader's `plugins/`: Kobo `.adds/koreader/plugins/`, Kindle `koreader/plugins/`, Android `/sdcard/koreader/plugins/`, desktop `~/.config/koreader/plugins/`.
 3. Quit KOReader completely and start it again.
 
-> Prebuilt packages are also available from [Releases](https://github.com/hugo1120/opdsforcomic.koplugin/releases); check the release tag for their version. Source updates do not imply that a matching release package has been uploaded.
+> Alternatively, download the [current source ZIP](https://github.com/hugo1120/opdsforcomic.koplugin/archive/refs/heads/main.zip) and rename the extracted `opdsforcomic.koplugin-main` folder to `opdsforcomic.koplugin`.
 
 ### Usage
 
